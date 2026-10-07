@@ -1,6 +1,38 @@
-(* Tessera dpixel download tool — downloads S2 and S1 satellite data
-   and writes the 7 .npy files in Frank's dpixel format.
-   Based on the download half of the original pipeline. *)
+(* Tessera dpixel download tool.
+
+   Downloads Sentinel-2 L2A + Sentinel-1 RTC for one 0.1-degree grid tile and
+   writes the d-pixel .npy arrays consumed by the Tessera encoders.
+
+   This is a port of dpixel.py (the worker pipeline's shared d-pixel core) and
+   is byte-identical to it on the default MPC path:
+
+   - Tile geometry is derived from the grid id exactly as
+     dpixel.load_roi_from_grid_id does (UTM zone from the centre longitude,
+     envelope of the four projected corners, integer 10 m pixels). The tiffs in
+     global_map_0.1_degree_tiff are all-ones by design, so no tiff is read.
+   - Each asset is warped onto the stackstac grid: bounds snapped outwards to
+     the 10 m grid (floor/ceil), the whole tile in one go, and the top-left
+     H x W pixels are kept. See warp_read for how rasterio's WarpedVRT read is
+     reproduced (block-wise warp for sources without nodata, which get an
+     alpha band; single whole-grid warp for sources with nodata).
+   - S2: SCL nearest, spectral bands bilinear, per-date first-valid-tile
+     selection, 0.01 % coverage filter, harmonisation (-1000 where >= 1000
+     after 2022-01-25), mask = tile selected.
+   - S1: nearest, dB = (20 log10 amp + 50) * 200 clipped to int16, per-date
+     mean over ALL of the date's scenes (both orbits), emitted once per orbit
+     present that day in sorted order (ascending, descending, unknown -> desc).
+     Polarisations are resolved by asset name so single-pol scenes work.
+   - Transient read failures are retried once, after re-searching STAC for
+     freshly signed URLs (waiting past the current SAS expiry if it is about
+     to roll over). A date whose scenes still fail is counted as read-failed.
+   - Coverage policy: no S2 items or every S2 date genuinely absent is a
+     permanent failure (exit 2); too many read-failed dates is a transient
+     failure to re-queue (exit 3).
+   - Output layout matches dpixel.save: <dir>/s2/{bands,masks,doys}.npy and
+     <dir>/s1/sar_{ascending,descending}{,_doy}.npy.
+
+   Verified byte-identical against stackstac 0.5.1 / rasterio 1.5.2
+   (GDAL 3.12.2, PROJ 9.8.1) with GDAL 3.8.4 and 3.11.4 on this side. *)
 
 open Bigarray
 
@@ -9,7 +41,7 @@ open Bigarray
 let s2_bands = [| "B04"; "B02"; "B03"; "B08"; "B8A"; "B05"; "B06"; "B07"; "B11"; "B12" |]
 let scl_invalid = [| 0; 1; 2; 3; 8; 9 |]
 let harmonisation_date_ymd = (2022, 1, 25)
-let harmonisation_offset = 1000.0
+let harmonisation_offset = 1000
 let stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
 type data_source = MPC | AWS
@@ -26,43 +58,16 @@ let opera_collection_id = "C2777436413-ASF"
 let s2_band_names = function MPC -> s2_bands | AWS -> s2_bands_aws
 let scl_asset_name = function MPC -> "SCL" | AWS -> "scl"
 
+(* SAS freshness knobs (dpixel._memoize_research) *)
+let sas_margin = 30.0
+let sas_grace = 5.0
+
 (* ======================== Utility helpers ======================== *)
 
-let is_scl_invalid v =
-  Array.exists (fun x -> x = v) scl_invalid
-
-(** Day-of-year from "YYYY-MM-DD" *)
-let doy_of_date_str s =
-  Scanf.sscanf s "%d-%d-%d" (fun y m d ->
-    let tm = { Unix.tm_sec = 0; tm_min = 0; tm_hour = 12;
-               tm_mday = d; tm_mon = m - 1; tm_year = y - 1900;
-               tm_wday = 0; tm_yday = 0; tm_isdst = false } in
-    let (_, tm') = Unix.mktime tm in
-    tm'.Unix.tm_yday + 1)
-
-(** Check if date_str > harmonisation_date *)
-let is_after_harmonisation date_str =
-  Scanf.sscanf date_str "%d-%d-%d" (fun y m d ->
-    let (hy, hm, hd) = harmonisation_date_ymd in
-    (y, m, d) > (hy, hm, hd))
-
-(** Extract just YYYY-MM-DD from an ISO datetime string *)
-let date_of_datetime dt =
-  if String.length dt >= 10 then String.sub dt 0 10
-  else dt
-
-(** Sort and deduplicate a string list *)
-let sort_uniq_strings lst =
-  List.sort_uniq String.compare lst
-
-(** Get asset href from a STAC item *)
-let get_asset_href (item : Stac_client.item) key =
-  match List.assoc_opt key item.assets with
-  | Some a -> Some a.href
-  | None -> None
-
-(** Printf to stderr for progress *)
 let eprintf fmt = Printf.eprintf fmt
+let printf fmt = Printf.printf fmt
+
+let is_scl_invalid v = Array.exists (fun x -> x = v) scl_invalid
 
 let rec mkdir_p dir =
   if dir <> "/" && dir <> "." && not (Sys.file_exists dir) then begin
@@ -70,106 +75,249 @@ let rec mkdir_p dir =
     (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
   end
 
-(* ======================== Flat bigarray types ======================== *)
+(** Days since 1970-01-01 for a proleptic Gregorian civil date. *)
+let days_from_civil y m d =
+  let y = if m <= 2 then y - 1 else y in
+  let era = (if y >= 0 then y else y - 399) / 400 in
+  let yoe = y - era * 400 in
+  let mp = (m + 9) mod 12 in
+  let doy = (153 * mp + 2) / 5 + d - 1 in
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy in
+  era * 146097 + doe - 719468
 
-(** Flat 4D array: [n_dates][height][width][channels] as contiguous float bigarray.
-    Index: ((d * h + i) * w + j) * c + b *)
-type flat_4d = {
-  data : (float, float64_elt, c_layout) Array1.t;
-  n : int; h : int; w : int; c : int;
-}
+(** Day-of-year (1-366) from "YYYY-MM-DD" *)
+let doy_of_date_str s =
+  Scanf.sscanf s "%d-%d-%d" (fun y m d ->
+    days_from_civil y m d - days_from_civil y 1 1 + 1)
 
-(** Flat 3D int array: [n_dates][height][width] as contiguous int bigarray.
-    Index: (d * h3 + i) * w3 + j *)
-type flat_3d_int = {
-  idata : (int, int_elt, c_layout) Array1.t;
-  n3 : int; h3 : int; w3 : int;
-}
+(** Parse an ISO-8601 UTC datetime "YYYY-MM-DDTHH:MM:SS[.ffffff]Z" to epoch
+    seconds (float, fractional part kept). Offsets other than Z are ignored
+    (STAC datetimes are UTC). *)
+let epoch_of_datetime s =
+  try
+    Scanf.sscanf s "%d-%d-%dT%d:%d:%d%s" (fun y mo d h mi sec rest ->
+      let frac =
+        if String.length rest > 1 && rest.[0] = '.' then begin
+          let digits = Buffer.create 6 in
+          (try String.iteri (fun i c ->
+             if i > 0 then (if c >= '0' && c <= '9' then Buffer.add_char digits c
+                            else raise Exit)) rest with Exit -> ());
+          let ds = Buffer.contents digits in
+          if ds = "" then 0.0
+          else float_of_string ("0." ^ ds)
+        end else 0.0 in
+      Float.of_int (days_from_civil y mo d) *. 86400.0
+      +. Float.of_int (h * 3600 + mi * 60 + sec) +. frac)
+  with _ -> 0.0
 
-let empty_flat_4d = { data = Array1.create float64 c_layout 0; n = 0; h = 0; w = 0; c = 0 }
-let empty_flat_3d_int = { idata = Array1.create int c_layout 0; n3 = 0; h3 = 0; w3 = 0 }
+(** Check if date_str > harmonisation_date *)
+let is_after_harmonisation date_str =
+  Scanf.sscanf date_str "%d-%d-%d" (fun y m d -> (y, m, d) > harmonisation_date_ymd)
 
-(** S1 tile: URLs for a single SAR tile's VV and VH polarisations *)
-type s1_tile = {
-  st_vv : string option;
-  st_vh : string option;
-}
+(** Extract just YYYY-MM-DD from an ISO datetime string *)
+let date_of_datetime dt =
+  if String.length dt >= 10 then String.sub dt 0 10 else dt
 
-(** S1 group: one (date, orbit) combination with its tiles *)
-type s1_group = {
-  sg_date : string;
-  sg_orbit : string;
-  sg_tiles : s1_tile list;
-}
+let item_datetime (it : Stac_client.item) =
+  match Stac_client.get_datetime it with Some d -> d | None -> ""
 
-(* ======================== Nested-to-flat converters ======================== *)
+(** Get asset href from a STAC item *)
+let get_asset_href (item : Stac_client.item) key =
+  match List.assoc_opt key item.assets with
+  | Some a -> Some a.href
+  | None -> None
 
-(** Convert nested float array array array array [n][h][w][c] to flat_4d *)
-let flatten_4d (arr : float array array array array) =
-  let n = Array.length arr in
-  if n = 0 then empty_flat_4d
-  else
-    let h = Array.length arr.(0) in
-    let w = Array.length arr.(0).(0) in
-    let c = Array.length arr.(0).(0).(0) in
-    let total = n * h * w * c in
-    let data = Array1.create float64 c_layout total in
-    for d = 0 to n - 1 do
-      for i = 0 to h - 1 do
-        for j = 0 to w - 1 do
-          let base = ((d * h + i) * w + j) * c in
-          for b = 0 to c - 1 do
-            Array1.set data (base + b) arr.(d).(i).(j).(b)
-          done
-        done
-      done
-    done;
-    { data; n; h; w; c }
+(** Retry [f] a few times with backoff; used around STAC search and SAS
+    signing, which fail transiently (gateway 5xx). *)
+let with_retries ?(attempts = 4) ~label f =
+  let rec go n delay =
+    try f () with exn when n < attempts ->
+      eprintf "  %s failed (%s); retrying in %.0fs\n%!" label (Printexc.to_string exn) delay;
+      Unix.sleepf delay;
+      go (n + 1) (delay *. 2.0)
+  in
+  go 1 2.0
 
-(** Convert nested int array array array [n][h][w] to flat_3d_int *)
-let flatten_3d_int (arr : int array array array) =
-  let n = Array.length arr in
-  if n = 0 then empty_flat_3d_int
-  else
-    let h = Array.length arr.(0) in
-    let w = Array.length arr.(0).(0) in
-    let total = n * h * w in
-    let idata = Array1.create int c_layout total in
-    for d = 0 to n - 1 do
-      for i = 0 to h - 1 do
-        for j = 0 to w - 1 do
-          Array1.set idata ((d * h + i) * w + j) arr.(d).(i).(j)
-        done
-      done
-    done;
-    { idata; n3 = n; h3 = h; w3 = w }
+(** Environment-driven defaults, same names as the Python worker stack. *)
+let env_int name default =
+  match Sys.getenv_opt name with
+  | Some v -> (try int_of_string (String.trim v) with _ -> default)
+  | None -> default
+
+let env_float name default =
+  match Sys.getenv_opt name with
+  | Some v -> (try float_of_string (String.trim v) with _ -> default)
+  | None -> default
+
+(** GDAL reads every config option from the environment itself; only supply a
+    default when the caller has not set one, so GDAL_NUM_THREADS, GDAL_CACHEMAX,
+    CPL_VSIL_CURL_CACHE_SIZE etc. in the environment win. *)
+let set_config_default key value =
+  if Sys.getenv_opt key = None then Gdal.set_config_option key value
 
 (* ======================== Parallel map ======================== *)
 
+(* OCaml 5 allows at most 128 domains including the main one. *)
+let max_domains = 120
+
 let parallel_map ~n_workers f items =
   let n = Array.length items in
-  if n = 0 || n_workers <= 1 then Array.map (fun x -> Some (f x)) items
+  if n = 0 then [||]
+  else if n_workers <= 1 || n = 1 then Array.map f items
   else begin
     let results = Array.make n None in
     let next = Atomic.make 0 in
-    let actual = min n_workers n in
+    let actual = min (min n_workers max_domains) n in
     let domains = Array.init actual (fun _ ->
       Domain.spawn (fun () ->
         let rec loop () =
           let i = Atomic.fetch_and_add next 1 in
           if i < n then begin
-            results.(i) <- (try Some (f items.(i)) with exn ->
-              Printf.eprintf "Warning: parallel task %d failed: %s\n%!" i
-                (Printexc.to_string exn); None);
+            results.(i) <- Some (f items.(i));
             loop ()
           end
         in loop ())
     ) in
     Array.iter Domain.join domains;
-    results
+    Array.map (function Some r -> r | None -> assert false) results
   end
 
-(* ======================== COG reading via GDAL warp ======================== *)
+(* ======================== ROI ======================== *)
+
+type roi = {
+  dst_srs : string;                         (* "EPSG:326xx" or WKT, for -t_srs *)
+  grid_bounds : float * float * float * float;  (* snapped minx, miny, maxx, maxy *)
+  w_out : int; h_out : int;                 (* snapped (stackstac) grid size *)
+  height : int; width : int;                (* output H, W (top-left crop) *)
+  resolution : float;
+  bbox : float * float * float * float;     (* lon/lat for STAC search *)
+}
+
+let parse_grid_id = Tessera_common.Tile_geom.parse_grid_id
+let snapped_bounds = Tessera_common.Tile_geom.snapped_bounds
+
+(** dpixel.load_roi_from_grid_id + stackstac's snap: see Tile_geom. *)
+let roi_of_grid lon lat =
+  let g = Tessera_common.Tile_geom.of_centre lon lat in
+  { dst_srs = Printf.sprintf "EPSG:%d" g.epsg;
+    grid_bounds = (g.minx, g.maxy -. 10.0 *. Float.of_int g.h_out,
+                   g.minx +. 10.0 *. Float.of_int g.w_out, g.maxy);
+    w_out = g.w_out; h_out = g.h_out; height = g.height; width = g.width; resolution = 10.0;
+    bbox = (lon -. 0.05, lat -. 0.05, lon +. 0.05, lat +. 0.05) }
+
+(* ======================== Grid-aligned windows ======================== *)
+
+(** A seeded Zarr zone grid (zarr_poc/zonegrid.py ZoneGrid). origin_y is the
+    CANONICAL northing: no false northing, negative south of the equator, so
+    one grid is continuous across both hemispheres. *)
+type zone_grid = {
+  zg_zone : int;
+  zg_epsg : int;          (* canonical northern EPSG, 326xx *)
+  zg_origin_x : float;
+  zg_origin_y : float;
+  zg_pixel : float;
+  zg_width_px : int;
+  zg_height_px : int;
+}
+
+(** Read a zone grid from either a `zone_grids.json` dump
+    ({"zones": {"30": {origin_x, origin_y, pixel, width_px, height_px, epsg}}})
+    or a genesis /work document ({"zone": 30, "grid": {origin_x, ...}}). *)
+let zone_grid_of_file path zone =
+  let json = Yojson.Safe.from_file path in
+  let member k = function `Assoc l -> List.assoc_opt k l | _ -> None in
+  let num = function Some (`Float f) -> f | Some (`Int i) -> Float.of_int i
+                   | _ -> failwith ("zone grid: missing numeric field in " ^ path) in
+  let int = function Some (`Int i) -> i | Some (`Float f) -> Float.to_int f
+                   | _ -> failwith ("zone grid: missing integer field in " ^ path) in
+  let g = match member "zones" json with
+    | Some zones ->
+      (match member (Printf.sprintf "%02d" zone) zones with
+       | Some g -> g
+       | None -> failwith (Printf.sprintf "zone grid: no zone %02d in %s" zone path))
+    | None ->
+      (match member "grid" json with
+       | Some g ->
+         (match member "zone" json with
+          | Some (`Int z) when z <> zone ->
+            failwith (Printf.sprintf "zone grid: %s describes zone %d, not %d" path z zone)
+          | _ -> ());
+         g
+       | None -> failwith ("zone grid: neither \"zones\" nor \"grid\" in " ^ path)) in
+  let epsg = match member "epsg" g with Some _ as e -> int e | None -> 32600 + zone in
+  { zg_zone = zone; zg_epsg = epsg;
+    zg_origin_x = num (member "origin_x" g); zg_origin_y = num (member "origin_y" g);
+    zg_pixel = (match member "pixel" g with Some _ as p -> num p | None -> 10.0);
+    zg_width_px = int (member "width_px" g); zg_height_px = int (member "height_px" g) }
+
+(** zonegrid.window_bbox_lonlat: lon/lat bbox of a projected window for the
+    STAC search, sampling the edges (a straight projected edge bows in lon/lat)
+    with a 0.01 degree margin. *)
+let window_bbox_lonlat ~epsg (left, bottom, right, top) =
+  let src = Gdal.SpatialReference.of_epsg epsg |> Result.get_ok in
+  let dst = Gdal.SpatialReference.of_epsg 4326 |> Result.get_ok in
+  Gdal.SpatialReference.set_axis_mapping_strategy src Gdal.oams_traditional_gis_order;
+  Gdal.SpatialReference.set_axis_mapping_strategy dst Gdal.oams_traditional_gis_order;
+  let ct = Gdal.CoordinateTransformation.create src dst |> Result.get_ok in
+  let n = 8 in
+  let pts = Array.concat (List.init (n + 1) (fun i ->
+    let fx = left +. (right -. left) *. Float.of_int i /. Float.of_int n in
+    let fy = bottom +. (top -. bottom) *. Float.of_int i /. Float.of_int n in
+    [| (fx, bottom); (fx, top); (left, fy); (right, fy) |])) in
+  let ll = Gdal.CoordinateTransformation.transform_points ct pts |> Result.get_ok in
+  Gdal.CoordinateTransformation.destroy ct;
+  Gdal.SpatialReference.destroy src;
+  Gdal.SpatialReference.destroy dst;
+  let lons = Array.map fst ll and lats = Array.map snd ll in
+  let fmin a = Array.fold_left Float.min a.(0) a and fmax a = Array.fold_left Float.max a.(0) a in
+  let margin = 0.01 in
+  (fmin lons -. margin, fmin lats -. margin, fmax lons +. margin, fmax lats +. margin)
+
+(** zarr_poc/dpixel_window.build_window geometry: a window cut from the zone
+    grid at pixel (row, col), h x w pixels. Bounds are exact multiples of the
+    pixel size so the stackstac snap is a no-op and nothing is cropped. The
+    imagery is read in the real CRS: south of the equator that is the 327xx
+    code and +10,000 km of northing. *)
+let roi_of_window (g : zone_grid) ~row ~col ~h ~w =
+  if row < 0 || col < 0 || h <= 0 || w <= 0
+     || row + h > g.zg_height_px || col + w > g.zg_width_px then
+    failwith (Printf.sprintf "window r%dc%d %dx%d does not fit zone %02d grid (%d x %d px)"
+                row col h w g.zg_zone g.zg_width_px g.zg_height_px);
+  let px = g.zg_pixel in
+  let left = g.zg_origin_x +. Float.of_int col *. px in
+  let top = g.zg_origin_y -. Float.of_int row *. px in
+  let bottom = top -. Float.of_int h *. px in
+  let right = left +. Float.of_int w *. px in
+  let south = bottom < 0.0 in
+  let epsg = if south then g.zg_epsg + 100 else g.zg_epsg in
+  let adj n = if south then n +. 10_000_000.0 else n in
+  let bounds = (left, adj bottom, right, adj top) in
+  let (minx, miny, maxx, maxy) as gb = snapped_bounds bounds px in
+  let w_out = Float.to_int (Float.round ((maxx -. minx) /. px)) in
+  let h_out = Float.to_int (Float.round ((maxy -. miny) /. px)) in
+  if w_out <> w || h_out <> h then
+    failwith (Printf.sprintf "window bounds are not grid-aligned: snapped to %dx%d, asked %dx%d"
+                h_out w_out h w);
+  { dst_srs = Printf.sprintf "EPSG:%d" epsg; grid_bounds = gb; w_out; h_out;
+    height = h; width = w; resolution = px;
+    bbox = window_bbox_lonlat ~epsg bounds }
+
+(** "ZONE:ROW:COL:HxW" *)
+let parse_window s =
+  match String.split_on_char ':' s with
+  | [ z; r; c; size ] ->
+    (match String.split_on_char 'x' size with
+     | [ h; w ] ->
+       (try Some (int_of_string z, int_of_string r, int_of_string c, int_of_string h, int_of_string w)
+        with _ -> None)
+     | _ -> None)
+  | _ -> None
+
+(* ======================== COG reading via warped VRT ======================== *)
+
+type failure_kind = Transient | Permanent
+
+exception Read_failure of failure_kind * string
 
 (** Convert a URL to a GDAL virtual filesystem path. *)
 let gdal_vsi_path url =
@@ -178,426 +326,544 @@ let gdal_vsi_path url =
   else
     "/vsicurl/" ^ url
 
-let warp_id = Atomic.make 0
+(** Warp [url] onto the ROI's snapped grid and return the top-left H x W
+    window of band 1 as a bigarray of the requested kind.
 
-let warp_to_mem ?(resampling="near") ~dst_crs_wkt ~bounds:(left, bottom, right, top)
-    ~width ~height url =
-  let id = Atomic.fetch_and_add warp_id 1 in
-  let dst = Printf.sprintf "/vsimem/warp_%d" id in
-  match Gdal.Dataset.open_ex ~thread_safe:true (gdal_vsi_path url) with
-  | Error msg ->
-    eprintf "Warning: open failed for %s: %s\n%!" url msg;
-    Error msg
-  | Ok src ->
-    let opts = [
-      "-t_srs"; dst_crs_wkt;
-      "-te"; Printf.sprintf "%.15g" left;
-             Printf.sprintf "%.15g" bottom;
-             Printf.sprintf "%.15g" right;
-             Printf.sprintf "%.15g" top;
-      "-ts"; string_of_int width; string_of_int height;
-      "-r"; resampling;
-      "-of"; "MEM";
-      "-srcnodata"; "none";
-    ] in
-    let result = Gdal.Dataset.warp src ~dst_filename:dst opts in
-    Gdal.Dataset.close src;
-    result
+    This reproduces what rasterio's WarpedVRT does under stackstac, which
+    depends on whether the source has a nodata value:
 
-let read_cog_band ?(resampling="near") ~dst_crs_wkt ~bounds ~width ~height url =
-  match warp_to_mem ~resampling ~dst_crs_wkt ~bounds ~width ~height url with
-  | Error _ ->
-    eprintf "Warning: warp failed for %s\n%!" url;
-    Array.make (height * width) 0.0
-  | Ok warped ->
-    let band = Gdal.Dataset.get_band warped 1 |> Result.get_ok in
-    let w_out = Gdal.RasterBand.x_size band |> Result.get_ok in
-    let h_out = Gdal.RasterBand.y_size band |> Result.get_ok in
-    match Gdal.RasterBand.read_region Gdal.BA_float64 band
-            ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
-            ~buf_x:w_out ~buf_y:h_out with
-    | Ok ba ->
-      let arr = Array.init (h_out * w_out) (fun i ->
-        Array2.get ba (i / w_out) (i mod w_out)) in
-      Gdal.Dataset.close warped; arr
-    | Error _ ->
-      eprintf "Warning: band read failed for %s\n%!" url;
-      Gdal.Dataset.close warped;
-      Array.make (height * width) 0.0
+    - No nodata (Sentinel-2 L2A on MPC): rasterio adds an alpha band
+      (add_alpha). GDAL's optimised whole-image read of a warped VRT refuses
+      datasets whose requested bands include a non-warped (alpha) band, so the
+      read falls back to the block cache: the warp is done in 512 x 128 blocks.
+      We build the same warped VRT (-dstalpha) and read band 1 through the band
+      API, which is the same block path in every GDAL version. In-footprint
+      zeros count as data (bilinear blends them); only alpha = 0 pixels are
+      masked, and those are zeroed here (dpixel.py: NaN -> 0).
+    - Nodata set (Sentinel-1 RTC, -32768): no alpha, one band, and rasterio's
+      whole-image read is a single WarpRegionToBuffer over the full snapped
+      grid. A single-chunk gdalwarp to MEM over the full grid is the same
+      operation (the fill-ratio heuristic that would split low-coverage
+      scenes into chunks is disabled), and works on GDAL 3.8 too. Nodata
+      pixels are zeroed.
 
-let read_cog_band_byte ~dst_crs_wkt ~bounds ~width ~height url =
-  match warp_to_mem ~dst_crs_wkt ~bounds ~width ~height url with
-  | Error _ ->
-    eprintf "Warning: warp failed for %s\n%!" url;
-    Array.make (height * width) 0
-  | Ok warped ->
-    let band = Gdal.Dataset.get_band warped 1 |> Result.get_ok in
-    let w_out = Gdal.RasterBand.x_size band |> Result.get_ok in
-    let h_out = Gdal.RasterBand.y_size band |> Result.get_ok in
-    match Gdal.RasterBand.read_byte band
-            ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out with
-    | Ok ba ->
-      let arr = Array.init (h_out * w_out) (fun i ->
-        Array2.get ba (i / w_out) (i mod w_out)) in
-      Gdal.Dataset.close warped; arr
-    | Error _ ->
-      eprintf "Warning: band read failed for %s\n%!" url;
-      Gdal.Dataset.close warped;
-      Array.make (height * width) 0
+    Reading a sub-window of the grid would change the scanline extents fed to
+    GDAL's approximate transformer and flip isolated nearest-neighbour pixels,
+    so the nodata path always warps the whole grid and crops afterwards.
+    Any GDAL failure is raised as a transient Read_failure. *)
+let warp_read (type a b) (kind : (a, b) Gdal.ba_kind_witness) ~(roi : roi) ~resampling url
+    : (a, b, c_layout) Array2.t =
+  let fail msg = raise (Read_failure (Transient, msg)) in
+  let src = match Gdal.Dataset.open_ex (gdal_vsi_path url) with
+    | Ok ds -> ds
+    | Error msg -> fail (Printf.sprintf "open failed: %s" msg) in
+  let finish_src () = Gdal.Dataset.close src in
+  let nodata =
+    match Gdal.Dataset.get_band src 1 with
+    | Ok b -> (match Gdal.RasterBand.no_data_value b with Ok nd -> nd | Error _ -> None)
+    | Error _ -> None in
+  let (minx, miny, maxx, maxy) = roi.grid_bounds in
+  let common = [
+    "-t_srs"; roi.dst_srs;
+    "-te"; Printf.sprintf "%.15g" minx; Printf.sprintf "%.15g" miny;
+           Printf.sprintf "%.15g" maxx; Printf.sprintf "%.15g" maxy;
+    "-ts"; string_of_int roi.w_out; string_of_int roi.h_out;
+    "-r"; resampling;
+  ] in
+  let opts = match nodata with
+    | None -> common @ [ "-of"; "VRT"; "-dstalpha" ]
+    | Some _ -> common @ [ "-of"; "MEM"; "-wo"; "SRC_FILL_RATIO_HEURISTICS=NO" ] in
+  let warped = match Gdal.Dataset.warp src ~dst_filename:"" opts with
+    | Ok ds -> ds
+    | Error msg -> finish_src (); fail (Printf.sprintf "warp failed: %s" msg) in
+  let finish () = Gdal.Dataset.close warped; finish_src () in
+  let zero : a = match kind with
+    | Gdal.BA_int8 -> 0 | Gdal.BA_byte -> 0 | Gdal.BA_uint16 -> 0 | Gdal.BA_int16 -> 0
+    | Gdal.BA_int32 -> 0l | Gdal.BA_int64 -> 0L
+    | Gdal.BA_float32 -> 0.0 | Gdal.BA_float64 -> 0.0 in
+  let band = match Gdal.Dataset.get_band warped 1 with
+    | Ok b -> b | Error msg -> finish (); fail msg in
+  let h = roi.height and w = roi.width in
+  match nodata with
+  | None ->
+    (* block path: sub-window read of band 1 + alpha *)
+    let read k b =
+      Gdal.RasterBand.read_region k b ~x_off:0 ~y_off:0 ~x_size:w ~y_size:h ~buf_x:w ~buf_y:h in
+    let data = match read kind band with
+      | Ok d -> d | Error msg -> finish (); fail (Printf.sprintf "read failed: %s" msg) in
+    (match Gdal.Dataset.get_band warped 2 with
+     | Ok ab ->
+       (match read Gdal.BA_byte ab with
+        | Ok alpha ->
+          for i = 0 to h - 1 do
+            for j = 0 to w - 1 do
+              if Array2.unsafe_get alpha i j = 0 then Array2.unsafe_set data i j zero
+            done
+          done
+        | Error msg -> finish (); fail (Printf.sprintf "alpha read failed: %s" msg))
+     | Error msg -> finish (); fail msg);
+    finish ();
+    data
+  | Some nd ->
+    (* whole-grid warp already done into MEM; crop and zero nodata *)
+    let full = match Gdal.RasterBand.read_region kind band ~x_off:0 ~y_off:0
+                       ~x_size:roi.w_out ~y_size:roi.h_out ~buf_x:roi.w_out ~buf_y:roi.h_out with
+      | Ok d -> d | Error msg -> finish (); fail (Printf.sprintf "read failed: %s" msg) in
+    finish ();
+    let data = Array2.create (Array2.kind full) c_layout h w in
+    let is_nodata : a -> bool = match kind with
+      | Gdal.BA_int8 -> fun v -> Float.of_int v = nd
+      | Gdal.BA_byte -> fun v -> Float.of_int v = nd
+      | Gdal.BA_uint16 -> fun v -> Float.of_int v = nd
+      | Gdal.BA_int16 -> fun v -> Float.of_int v = nd
+      | Gdal.BA_int32 -> fun v -> Int32.to_float v = nd
+      | Gdal.BA_int64 -> fun v -> Int64.to_float v = nd
+      | Gdal.BA_float32 -> fun v -> v = nd || Float.is_nan v
+      | Gdal.BA_float64 -> fun v -> v = nd || Float.is_nan v in
+    for i = 0 to h - 1 do
+      for j = 0 to w - 1 do
+        let v = Array2.unsafe_get full i j in
+        Array2.unsafe_set data i j (if is_nodata v then zero else v)
+      done
+    done;
+    data
 
-(* ======================== load_roi ======================== *)
+(* ======================== STAC items ======================== *)
 
-type roi = {
-  crs_wkt : string;
-  bounds : float * float * float * float;
-  bbox : float * float * float * float;
-  height : int;
-  width : int;
-  resolution : float;
-  mask : int array array;
+type s_item = {
+  it : Stac_client.item;   (* signed *)
+  dt : float;              (* epoch seconds *)
+  date : string;           (* YYYY-MM-DD (UTC) *)
+  orbit : string;          (* sat:orbit_state or "unknown" *)
 }
 
-let load_roi tiff_path =
-  Gdal.init ();
-  let ds = Gdal.Dataset.open_ tiff_path |> Result.get_ok in
-  let h = Gdal.Dataset.raster_y_size ds in
-  let w = Gdal.Dataset.raster_x_size ds in
-  let band = Gdal.Dataset.get_band ds 1 |> Result.get_ok in
-  let data = Gdal.RasterBand.read_region Gdal.BA_float64 band
-               ~x_off:0 ~y_off:0 ~x_size:w ~y_size:h
-               ~buf_x:w ~buf_y:h |> Result.get_ok in
-  let mask = Array.init h (fun i ->
-    Array.init w (fun j ->
-      if Array2.get data i j > 0.0 then 1 else 0)) in
-  let gt = Gdal.Dataset.get_geo_transform ds |> Result.get_ok in
-  let left = gt.origin_x in
-  let pixel_w = gt.pixel_width in
-  let top = gt.origin_y in
-  let pixel_h = gt.pixel_height in
-  let right = left +. (Float.of_int w *. pixel_w) in
-  let bottom = top +. (Float.of_int h *. pixel_h) in
-  let resolution = Float.abs pixel_w in
-  let crs_wkt = Gdal.Dataset.projection ds in
-  let src_srs = Gdal.SpatialReference.of_epsg 4326 |> Result.get_ok in
-  let tile_srs = Gdal.SpatialReference.of_wkt crs_wkt |> Result.get_ok in
-  let ct = Gdal.CoordinateTransformation.create tile_srs src_srs |> Result.get_ok in
-  let (xmin4326, ymin4326, xmax4326, ymax4326) =
-    Gdal.CoordinateTransformation.transform_bounds ct
-      ~xmin:(Float.min left right) ~ymin:(Float.min bottom top)
-      ~xmax:(Float.max left right) ~ymax:(Float.max bottom top)
-      ~density:21
-    |> Result.get_ok
-  in
-  Gdal.CoordinateTransformation.destroy ct;
-  Gdal.SpatialReference.destroy tile_srs;
-  Gdal.SpatialReference.destroy src_srs;
-  Gdal.Dataset.close ds;
-  { crs_wkt;
-    bounds = (left, bottom, right, top);
-    bbox = (xmin4326, ymin4326, xmax4326, ymax4326);
-    height = h;
-    width = w;
-    resolution;
-    mask }
+let s_item_of (it : Stac_client.item) =
+  let dts = item_datetime it in
+  { it; dt = epoch_of_datetime dts; date = date_of_datetime dts;
+    orbit = (match Stac_client.get_string_prop it "sat:orbit_state" with
+             | Some o -> o | None -> "unknown") }
+
+(** Group by acquisition date; dates sorted; within a date a stable sort by
+    datetime so ties keep STAC order (matches dpixel.py). *)
+let group_by_date (items : s_item list) =
+  let tbl = Hashtbl.create 64 in
+  List.iter (fun si ->
+    let prev = try Hashtbl.find tbl si.date with Not_found -> [] in
+    Hashtbl.replace tbl si.date (si :: prev)) items;
+  let dates = List.sort String.compare (Hashtbl.fold (fun k _ acc -> k :: acc) tbl []) in
+  List.map (fun d ->
+    let its = List.rev (Hashtbl.find tbl d) in
+    (d, List.stable_sort (fun a b -> compare a.dt b.dt) its)) dates
+
+(* -- SAS expiry / re-search memoisation (dpixel._memoize_research) --------- *)
+
+let url_decode s =
+  let b = Buffer.create (String.length s) in
+  let n = String.length s in
+  let rec go i =
+    if i < n then begin
+      if s.[i] = '%' && i + 2 < n then begin
+        (try Buffer.add_char b (Char.chr (int_of_string ("0x" ^ String.sub s (i + 1) 2)))
+         with _ -> Buffer.add_char b '%');
+        go (i + 3)
+      end else begin Buffer.add_char b s.[i]; go (i + 1) end
+    end in
+  go 0; Buffer.contents b
+
+(** Earliest SAS expiry (epoch) over all asset hrefs' [se=] query params. *)
+let sas_expiry_epoch (items : Stac_client.item list) =
+  List.fold_left (fun acc (it : Stac_client.item) ->
+    List.fold_left (fun acc (_, (a : Stac_client.asset)) ->
+      match String.index_opt a.href '?' with
+      | None -> acc
+      | Some q ->
+        let query = String.sub a.href (q + 1) (String.length a.href - q - 1) in
+        List.fold_left (fun acc kv ->
+          match String.index_opt kv '=' with
+          | Some e when String.sub kv 0 e = "se" ->
+            let v = url_decode (String.sub kv (e + 1) (String.length kv - e - 1)) in
+            let t = epoch_of_datetime v in
+            if t <= 0.0 then acc
+            else (match acc with None -> Some t | Some a -> Some (Float.min a t))
+          | _ -> acc) acc (String.split_on_char '&' query)
+    ) acc it.assets) None items
+
+(** Wrap a search+sign closure so it only re-runs when the cached signed URLs
+    are near expiry, waiting past the real expiry so PC rolls its token. Must
+    be called from the main domain only. *)
+let memoize_research (re_search : (unit -> Stac_client.item list) option) =
+  match re_search with
+  | None -> None
+  | Some rs ->
+    let cache = ref None in
+    Some (fun () ->
+      let rec go tries =
+        let now = Unix.gettimeofday () in
+        match !cache with
+        | Some (items, exp) when (exp = None || now < Option.get exp -. sas_margin) -> items
+        | _ when tries >= 3 -> (match !cache with Some (items, _) -> items | None -> [])
+        | _ ->
+          (match !cache with
+           | Some (_, Some exp) when now < exp ->
+             let wait = exp -. now +. sas_grace in
+             printf "  SAS token expires in %.0fs; waiting %.0fs for PC to roll over before re-searching\n%!"
+               (exp -. now) wait;
+             Unix.sleepf wait
+           | _ -> ());
+          let items = with_retries ~label:"STAC re-search" rs in
+          cache := Some (items, sas_expiry_epoch items);
+          go (tries + 1)
+      in
+      go 0)
+
+(** Replace failed items by their freshly signed counterparts (by id). Items
+    missing from the fresh search are dropped. *)
+let refresh_items research (failed : s_item list) =
+  match research with
+  | None -> []
+  | Some rs ->
+    let fresh = rs () in
+    let tbl = Hashtbl.create 64 in
+    List.iter (fun (it : Stac_client.item) -> Hashtbl.replace tbl it.id it) fresh;
+    List.filter_map (fun si ->
+      match Hashtbl.find_opt tbl si.it.id with
+      | Some it -> Some { si with it }
+      | None -> None) failed
+
+(* ======================== Coverage ======================== *)
+
+type coverage = {
+  mutable found : int;
+  mutable valid : int;
+  mutable cloud : int;
+  mutable read_failed : int;
+  mutable unavailable : int;
+}
+
+let new_coverage () = { found = 0; valid = 0; cloud = 0; read_failed = 0; unavailable = 0 }
+
+let read_fail_frac c =
+  if c.found = 0 then 0.0 else Float.of_int c.read_failed /. Float.of_int c.found
+
+(* ======================== Output frames ======================== *)
+
+type u16 = (int, int16_unsigned_elt, c_layout) Array1.t
+type u8 = (int, int8_unsigned_elt, c_layout) Array1.t
+type i16 = (int, int16_signed_elt, c_layout) Array1.t
+
+let flat2 (a : (_, _, c_layout) Array2.t) = reshape_1 (genarray_of_array2 a) (Array2.dim1 a * Array2.dim2 a)
 
 (* ======================== process_s2 ======================== *)
 
-let process_s2 ~(roi : roi) ~(client : Stac_client.t) ~data_source ~n_workers items =
+type s2_date_result =
+  | S2_ok of u16 * u8 * int        (* bands (H*W*10), mask (H*W), doy *)
+  | S2_retry of s_item list        (* items that failed transiently *)
+  | S2_dropped                     (* all items failed permanently after retry *)
+
+let process_s2 ~(roi : roi) ~data_source ~n_workers ~research (items : s_item list) =
   let h = roi.height and w = roi.width in
-  let (left, bottom, right, top) = roi.bounds in
+  let hw = h * w in
+  let cov = new_coverage () in
   if items = [] then begin
-    eprintf "  No S2 items found\n%!";
-    ([||], [||], [||])
+    printf "  No S2 items found\n%!";
+    ([], [], [], cov)
   end else begin
-    eprintf "  Loading SCL (cloud mask)...\n%!";
-    let item_dates = Array.of_list (List.map (fun (it : Stac_client.item) ->
-      date_of_datetime (match Stac_client.get_datetime it with Some d -> d | None -> "")
-    ) items) in
-    let items_arr = Array.of_list items in
-    let dates = sort_uniq_strings (Array.to_list item_dates) in
-    let roi_total = Array.fold_left (fun acc row ->
-      acc + Array.fold_left ( + ) 0 row) 0 roi.mask in
+    let by_date = group_by_date items in
+    cov.found <- List.length by_date;
+    printf "  Streaming %d S2 scenes across %d dates...\n%!" (List.length items) (List.length by_date);
 
-    let signed_items = Array.map (fun item -> match data_source with
-      | MPC -> Stac_client.sign_planetary_computer client item
-      | AWS -> item) items_arr in
-
-    let n_items = Array.length items_arr in
-    let scl_results = parallel_map ~n_workers (fun i ->
-      let access_item = signed_items.(i) in
-      match get_asset_href access_item (scl_asset_name data_source) with
-      | None ->
-        eprintf "  Warning: item %s has no SCL asset\n%!" items_arr.(i).id;
-        Array.make (h * w) 0
+    (* ---- Pass 1: SCL for every scene (parallel), retry transients once ---- *)
+    let scl_name = scl_asset_name data_source in
+    let load_scl (si : s_item) =
+      match get_asset_href si.it scl_name with
+      | None -> Error (Permanent, "no SCL asset")
       | Some href ->
-        read_cog_band_byte ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
-          ~width:w ~height:h href
-    ) (Array.init n_items Fun.id) in
-    let scl_data = Array.map (fun opt -> match opt with
-      | Some d -> d
-      | None -> Array.make (h * w) 0) scl_results in
+        (try Ok (warp_read Gdal.BA_byte ~roi ~resampling:"near" href)
+         with Read_failure (k, m) -> Error (k, m)) in
+    let all_items = Array.of_list items in
+    let results = parallel_map ~n_workers load_scl all_items in
+    let scl_tbl = Hashtbl.create 256 in     (* item id -> scl array *)
+    let failed_tbl = Hashtbl.create 16 in   (* item id -> failure kind *)
+    Array.iteri (fun i r -> match r with
+      | Ok a -> Hashtbl.replace scl_tbl all_items.(i).it.id a
+      | Error (k, m) ->
+        eprintf "  first-pass skipped %s (SCL): %s\n%!" all_items.(i).it.id m;
+        Hashtbl.replace failed_tbl all_items.(i).it.id k) results;
+    let transient = List.filter (fun si ->
+      Hashtbl.find_opt failed_tbl si.it.id = Some Transient) items in
+    if transient <> [] && research <> None then begin
+      printf "  re-searching STAC for %d retry items with fresh signatures...\n%!" (List.length transient);
+      let retry = Array.of_list (refresh_items research transient) in
+      let rr = parallel_map ~n_workers load_scl retry in
+      Array.iteri (fun i r -> match r with
+        | Ok a -> Hashtbl.replace scl_tbl retry.(i).it.id a; Hashtbl.remove failed_tbl retry.(i).it.id
+        | Error (_, m) -> eprintf "  retry-pass skipped %s (SCL): %s\n%!" retry.(i).it.id m) rr
+    end;
 
-    let valid_dates = ref [] in
-    let day_tile_sel = Hashtbl.create 64 in
-    List.iter (fun date_str ->
-      let indices = ref [] in
-      Array.iteri (fun i d -> if d = date_str then indices := i :: !indices) item_dates;
-      let indices = List.rev !indices in
-      let n_tiles = List.length indices in
+    (* ---- tile selection per date ---- *)
+    let valid_dates = List.filter_map (fun (date, date_items) ->
+      let scl_items = List.filter (fun si -> Hashtbl.mem scl_tbl si.it.id) date_items in
+      if scl_items = [] then begin
+        let any_transient = List.exists (fun si ->
+          Hashtbl.find_opt failed_tbl si.it.id = Some Transient) date_items in
+        if any_transient then cov.read_failed <- cov.read_failed + 1
+        else cov.unavailable <- cov.unavailable + 1;
+        None
+      end else begin
+        let tile_sel = Array1.create int16_signed c_layout hw in
+        Array1.fill tile_sel (-1);
+        List.iteri (fun t si ->
+          let scl = flat2 (Hashtbl.find scl_tbl si.it.id) in
+          for p = 0 to hw - 1 do
+            if Array1.unsafe_get tile_sel p < 0
+               && not (is_scl_invalid (Array1.unsafe_get scl p)) then
+              Array1.unsafe_set tile_sel p t
+          done) scl_items;
+        let valid_cnt = ref 0 in
+        for p = 0 to hw - 1 do if Array1.unsafe_get tile_sel p >= 0 then incr valid_cnt done;
+        let valid_pct = 100.0 *. Float.of_int !valid_cnt /. Float.of_int hw in
+        if valid_pct < 0.01 then begin cov.cloud <- cov.cloud + 1; None end
+        else Some (date, scl_items, tile_sel)
+      end) by_date in
+    (* SCL arrays for cloud-filtered dates are no longer needed *)
+    let keep = Hashtbl.create 256 in
+    List.iter (fun (_, its, _) -> List.iter (fun si -> Hashtbl.replace keep si.it.id ()) its) valid_dates;
+    Hashtbl.filter_map_inplace (fun id a -> if Hashtbl.mem keep id then Some a else None) scl_tbl;
+    printf "  %d/%d dates pass cloud filter\n%!" (List.length valid_dates) (List.length by_date);
 
-      let tile_sel = Array.init h (fun _ -> Array.make w (-1)) in
-      let assigned = Array.init h (fun _ -> Array.make w false) in
-      List.iteri (fun _t_idx item_idx ->
-        let scl = scl_data.(item_idx) in
-        for i = 0 to h - 1 do
-          for j = 0 to w - 1 do
-            if roi.mask.(i).(j) > 0 && not assigned.(i).(j) then begin
-              let v = scl.(i * w + j) in
-              if not (is_scl_invalid v) then begin
-                tile_sel.(i).(j) <- _t_idx;
-                assigned.(i).(j) <- true
-              end
-            end
-          done
-        done
-      ) indices;
-      ignore n_tiles;
-
-      let valid_cnt = ref 0 in
-      for i = 0 to h - 1 do
-        for j = 0 to w - 1 do
-          if tile_sel.(i).(j) >= 0 then incr valid_cnt
-        done
-      done;
-      let valid_pct = if roi_total > 0
-        then 100.0 *. Float.of_int !valid_cnt /. Float.of_int roi_total
-        else 0.0 in
-      if valid_pct >= 0.01 then begin
-        valid_dates := date_str :: !valid_dates;
-        Hashtbl.replace day_tile_sel date_str tile_sel
-      end
-    ) dates;
-    let valid_dates = List.rev !valid_dates in
-    eprintf "  %d/%d dates pass cloud filter\n%!" (List.length valid_dates) (List.length dates);
-
-    if valid_dates = [] then
-      ([||], [||], [||])
-    else begin
-      eprintf "  Loading spectral bands...\n%!";
-      let valid_dates_arr = Array.of_list valid_dates in
-      let date_results = parallel_map ~n_workers (fun date_str ->
-        let doy = doy_of_date_str date_str in
-        let tile_sel = Hashtbl.find day_tile_sel date_str in
-        let indices = ref [] in
-        Array.iteri (fun i d -> if d = date_str then indices := i :: !indices) item_dates;
-        let indices = List.rev !indices in
-
-        let tile_band_data = List.map (fun item_idx ->
-          let access_item = signed_items.(item_idx) in
-          Array.map (fun band_name ->
-            match get_asset_href access_item band_name with
-            | None -> Array.make (h * w) 0.0
-            | Some href ->
-              read_cog_band ~resampling:"cubic" ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
-                ~width:w ~height:h href
-          ) (s2_band_names data_source)
-        ) indices in
-        let tile_band_data = Array.of_list tile_band_data in
-        let n_tiles = Array.length tile_band_data in
-
-        let out_bands = Array.init h (fun _ -> Array.init w (fun _ -> Array.make 10 0.0)) in
+    (* ---- Pass 2: spectral bands per valid date ---- *)
+    let band_names = s2_band_names data_source in
+    let harmonise = data_source = MPC in
+    let load_date (date, (scl_items : s_item list), (tile_sel : i16)) =
+      let n_tiles = List.length scl_items in
+      let failed = ref [] in
+      let tile_bands = List.map (fun si ->
+        try
+          Some (Array.map (fun band ->
+            match get_asset_href si.it band with
+            | None -> raise (Read_failure (Permanent, "no " ^ band ^ " asset"))
+            | Some href -> flat2 (warp_read Gdal.BA_uint16 ~roi ~resampling:"bilinear" href)
+          ) band_names)
+        with Read_failure (k, m) ->
+          eprintf "  %s: skipped %s (%s): %s\n%!" date si.it.id
+            (match k with Transient -> "transient" | Permanent -> "permanent") m;
+          if k = Transient then failed := si :: !failed;
+          None) scl_items in
+      if !failed <> [] then S2_retry (List.rev !failed)
+      else if List.exists Option.is_none tile_bands then S2_dropped
+      else begin
+        let tiles = Array.of_list (List.map Option.get tile_bands) in
+        let after = harmonise && is_after_harmonisation date in
+        let out : u16 = Array1.create int16_unsigned c_layout (hw * 10) in
         for bi = 0 to 9 do
-          for i = 0 to h - 1 do
-            for j = 0 to w - 1 do
-              let ts = tile_sel.(i).(j) in
-              let v =
-                if ts >= 0 && ts < n_tiles then
-                  tile_band_data.(ts).(bi).(i * w + j)
-                else if roi.mask.(i).(j) > 0 && n_tiles > 0 then
-                  tile_band_data.(0).(bi).(i * w + j)
-                else
-                  0.0
-              in
-              (* MPC stores RAW post-PB-04.00 values (+1000 offset present) and
-                 must be harmonised here. AWS Element84 earth-search has already
-                 applied the BOA_ADD_OFFSET at COG-generation time, so subtracting
-                 again would double-apply it. *)
-              let v =
-                if data_source = MPC
-                   && is_after_harmonisation date_str
-                   && v >= harmonisation_offset
-                then v -. harmonisation_offset
-                else v
-              in
-              let v = Float.max 0.0 (Float.min 65535.0 v) in
-              out_bands.(i).(j).(bi) <- v
-            done
+          for p = 0 to hw - 1 do
+            let ts = Array1.unsafe_get tile_sel p in
+            let v =
+              if ts >= 0 && ts < n_tiles then Array1.unsafe_get tiles.(ts).(bi) p
+              else if n_tiles > 0 then Array1.unsafe_get tiles.(0).(bi) p
+              else 0 in
+            let v = if after && v >= harmonisation_offset then v - harmonisation_offset else v in
+            Array1.unsafe_set out (p * 10 + bi) v
           done
         done;
-
-        let out_mask = Array.init h (fun i ->
-          Array.init w (fun j ->
-            if tile_sel.(i).(j) >= 0 then 1 else 0)) in
-
-        (out_bands, out_mask, doy)
-      ) valid_dates_arr in
-
-      let all_bands = ref [] in
-      let all_masks = ref [] in
-      let all_doys = ref [] in
-      Array.iter (fun opt -> match opt with
-        | Some (bands, mask, doy) ->
-          all_bands := bands :: !all_bands;
-          all_masks := mask :: !all_masks;
-          all_doys := doy :: !all_doys
-        | None -> ()
-      ) date_results;
-
-      (Array.of_list (List.rev !all_bands),
-       Array.of_list (List.rev !all_masks),
-       Array.of_list (List.rev !all_doys))
-    end
+        let mask : u8 = Array1.create int8_unsigned c_layout hw in
+        for p = 0 to hw - 1 do
+          Array1.unsafe_set mask p (if Array1.unsafe_get tile_sel p >= 0 then 1 else 0)
+        done;
+        S2_ok (out, mask, doy_of_date_str date)
+      end in
+    let valid_arr = Array.of_list valid_dates in
+    let results = parallel_map ~n_workers load_date valid_arr in
+    (* retry-at-end: dates whose scenes failed transiently, with fresh URLs *)
+    let retry_idx = List.filter (fun i -> match results.(i) with S2_retry _ -> true | _ -> false)
+        (List.init (Array.length results) Fun.id) in
+    if retry_idx <> [] && research <> None then begin
+      let n_items = List.fold_left (fun acc i -> match results.(i) with
+        | S2_retry l -> acc + List.length l | _ -> acc) 0 retry_idx in
+      printf "  re-searching STAC for %d retry items with fresh signatures...\n%!" n_items;
+      let fresh_dates = Array.of_list (List.map (fun i ->
+        let (date, scl_items, tile_sel) = valid_arr.(i) in
+        let refreshed = refresh_items research scl_items in
+        (* keep the original ordering; drop scenes that vanished *)
+        let scl_items = List.filter_map (fun si ->
+          List.find_opt (fun r -> r.it.id = si.it.id) refreshed) scl_items in
+        (date, scl_items, tile_sel)) retry_idx) in
+      let rr = parallel_map ~n_workers (fun (date, scl_items, tile_sel) ->
+        if List.length scl_items = 0 then S2_dropped
+        else load_date (date, scl_items, tile_sel)) fresh_dates in
+      List.iteri (fun k i -> results.(i) <- rr.(k)) retry_idx
+    end;
+    let bands = ref [] and masks = ref [] and doys = ref [] in
+    Array.iteri (fun i r ->
+      let (date, _, _) = valid_arr.(i) in
+      match r with
+      | S2_ok (b, m, d) -> bands := b :: !bands; masks := m :: !masks; doys := d :: !doys
+      | S2_retry _ | S2_dropped ->
+        printf "  dropping %s: SCL valid but spectral bands did not load\n%!" date;
+        cov.read_failed <- cov.read_failed + 1) results;
+    cov.valid <- List.length !bands;
+    printf "  S2 coverage: %d valid, %d cloud, %d read-failed, %d unavailable of %d dates\n%!"
+      cov.valid cov.cloud cov.read_failed cov.unavailable cov.found;
+    (List.rev !bands, List.rev !masks, List.rev !doys, cov)
   end
 
 (* ======================== S1 processing ======================== *)
 
-let amplitude_to_db amp_arr mask_arr h w =
-  let out = Array.init h (fun _ -> Array.make w 0) in
-  for i = 0 to h - 1 do
-    for j = 0 to w - 1 do
-      if mask_arr.(i).(j) > 0 then begin
-        let amp = amp_arr.(i * w + j) in
-        if Float.is_finite amp && amp > 0.0 then begin
-          let db = 20.0 *. Float.log10 amp +. 50.0 in
-          let scaled = db *. 200.0 in
-          out.(i).(j) <- Float.to_int (Float.min 32767.0 (Float.max 0.0 scaled))
-        end
-      end
-    done
+(** amplitude -> scaled dB int16 (H*W), zero where amp invalid.
+    (20*log10(amp) + 50) * 200, clipped to [0, 32767], truncated. *)
+let amplitude_to_db ~(roi : roi) (amp : (float, float32_elt, c_layout) Array1.t) : i16 =
+  let hw = roi.height * roi.width in
+  let out = Array1.create int16_signed c_layout hw in
+  for p = 0 to hw - 1 do
+    let a = Array1.unsafe_get amp p in
+    let v =
+      if Float.is_finite a && a > 0.0 then begin
+        let scaled = (20.0 *. Float.log10 a +. 50.0) *. 200.0 in
+        Float.to_int (Float.min 32767.0 (Float.max 0.0 scaled))
+      end else 0 in
+    Array1.unsafe_set out p v
   done;
   out
 
-let prepare_s1_mpc ~(client : Stac_client.t) items =
-  if items = [] then []
+(** Mean of the positive dB values across tiles, truncated to int16; None if
+    no pixel is valid in any tile. *)
+let mosaic_mean ~hw (db_list : i16 list) : i16 option =
+  if db_list = [] then None
   else begin
-    let by_date_orbit = Hashtbl.create 64 in
-    List.iter (fun (item : Stac_client.item) ->
-      let dt = date_of_datetime (match Stac_client.get_datetime item with Some d -> d | None -> "") in
-      let orbit = match Stac_client.get_string_prop item "sat:orbit_state" with
-        | Some o -> o | None -> "unknown" in
-      let key = (dt, orbit) in
-      let prev = try Hashtbl.find by_date_orbit key with Not_found -> [] in
-      Hashtbl.replace by_date_orbit key (item :: prev)
-    ) items;
-    let sorted_keys = List.sort compare (Hashtbl.fold (fun k _ acc -> k :: acc) by_date_orbit []) in
-    List.map (fun (date_str, orbit) ->
-      let group_items = List.rev (Hashtbl.find by_date_orbit (date_str, orbit)) in
-      let tiles = List.map (fun (item : Stac_client.item) ->
-        let signed = Stac_client.sign_planetary_computer client item in
-        { st_vv = get_asset_href signed "vv";
-          st_vh = get_asset_href signed "vh" }
-      ) group_items in
-      { sg_date = date_str; sg_orbit = orbit; sg_tiles = tiles }
-    ) sorted_keys
+    let sum = Array1.create float64 c_layout hw in
+    Array1.fill sum 0.0;
+    let cnt = Bytes.make hw '\000' in
+    let any = ref false in
+    List.iter (fun db ->
+      for p = 0 to hw - 1 do
+        let v = Array1.unsafe_get db p in
+        if v > 0 then begin
+          any := true;
+          Array1.unsafe_set sum p (Array1.unsafe_get sum p +. Float.of_int v);
+          Bytes.unsafe_set cnt p (Char.unsafe_chr (Char.code (Bytes.unsafe_get cnt p) + 1))
+        end
+      done) db_list;
+    if not !any then None
+    else begin
+      let out = Array1.create int16_signed c_layout hw in
+      for p = 0 to hw - 1 do
+        let c = Char.code (Bytes.unsafe_get cnt p) in
+        Array1.unsafe_set out p
+          (if c > 0 then Float.to_int (Array1.unsafe_get sum p /. Float.of_int c) else 0)
+      done;
+      Some out
+    end
   end
 
-let process_s1_groups ~(roi : roi) ~n_workers ~data_source groups =
-  let h = roi.height and w = roi.width in
-  let (left, bottom, right, top) = roi.bounds in
-  let resampling = match data_source with MPC -> "near" | AWS -> "bilinear" in
-  if groups = [] then begin
-    eprintf "  No S1 data to process\n%!";
-    ([||], [||], [||], [||])
+(** Last-valid-wins mosaic (OPERA path, unchanged from the original tool). *)
+let mosaic_last ~hw (db_list : i16 list) : i16 option =
+  if db_list = [] then None
+  else begin
+    let out = Array1.create int16_signed c_layout hw in
+    Array1.fill out 0;
+    List.iter (fun db ->
+      for p = 0 to hw - 1 do
+        let v = Array1.unsafe_get db p in
+        if v > 0 then Array1.unsafe_set out p v
+      done) db_list;
+    Some out
+  end
+
+let interleave_vv_vh ~hw (vv : i16 option) (vh : i16 option) : i16 =
+  let out = Array1.create int16_signed c_layout (hw * 2) in
+  for p = 0 to hw - 1 do
+    Array1.unsafe_set out (2 * p) (match vv with Some a -> Array1.unsafe_get a p | None -> 0);
+    Array1.unsafe_set out (2 * p + 1) (match vh with Some a -> Array1.unsafe_get a p | None -> 0)
+  done;
+  out
+
+type s1_date_result =
+  | S1_frames of (string * int * i16) list   (* (orbit, doy, frame) *)
+  | S1_retry of s_item list
+  | S1_unavailable                           (* no loadable scene (e.g. HH/HV) *)
+  | S1_skipped                               (* loaded but nothing valid in ROI *)
+
+(** dpixel.process_s1 (MPC): per date, mosaic ALL of the date's scenes, then
+    emit that mosaic once per orbit present, in sorted orbit order. *)
+let process_s1_mpc ~(roi : roi) ~n_workers ~research (items : s_item list) =
+  let hw = roi.height * roi.width in
+  let cov = new_coverage () in
+  if items = [] then begin
+    printf "  No S1 items found\n%!";
+    ([], [], [], [], cov)
   end else begin
-    eprintf "  Loading SAR data (%d groups)...\n%!" (List.length groups);
-
-    let group_results = parallel_map ~n_workers (fun group ->
-      let doy = doy_of_date_str group.sg_date in
-
-      let mosaic_pol get_url =
-        let db_list = List.filter_map (fun tile ->
-          match get_url tile with
-          | None -> None
-          | Some url ->
-            let amp = read_cog_band ~resampling ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
-                        ~width:w ~height:h url in
-            let db = amplitude_to_db amp roi.mask h w in
-            let has_any = ref false in
-            Array.iter (fun row ->
-              Array.iter (fun v -> if v > 0 then has_any := true) row) db;
-            if !has_any then Some db else None
-        ) group.sg_tiles in
-        if db_list = [] then None
+    let by_date = group_by_date items in
+    cov.found <- List.length by_date;
+    printf "  Streaming %d S1 scenes across %d dates...\n%!" (List.length items) (List.length by_date);
+    let load_date (date, (date_items : s_item list)) =
+      let failed = ref [] in
+      let loaded = List.filter_map (fun si ->
+        let vv = get_asset_href si.it "vv" and vh = get_asset_href si.it "vh" in
+        if vv = None && vh = None then begin
+          eprintf "  %s: skipped %s: no vv/vh asset (wrong polarisation)\n%!" date si.it.id;
+          None
+        end else
+          try
+            let rd = function
+              | None -> None
+              | Some href ->
+                Some (amplitude_to_db ~roi (flat2 (warp_read Gdal.BA_float32 ~roi ~resampling:"near" href))) in
+            Some (si, rd vv, rd vh)
+          with Read_failure (_, m) ->
+            eprintf "  %s: skipped %s: %s\n%!" date si.it.id m;
+            failed := si :: !failed; None) date_items in
+      if !failed <> [] then S1_retry (List.rev !failed)
+      else if loaded = [] then S1_unavailable
+      else begin
+        let vv_out = mosaic_mean ~hw (List.filter_map (fun (_, vv, _) -> vv) loaded) in
+        let vh_out = mosaic_mean ~hw (List.filter_map (fun (_, _, vh) -> vh) loaded) in
+        if vv_out = None && vh_out = None then S1_skipped
         else begin
-          match data_source with
-          | MPC ->
-            let sum = Array.init h (fun _ -> Array.make w 0.0) in
-            let cnt = Array.init h (fun _ -> Array.make w 0) in
-            List.iter (fun db ->
-              for i = 0 to h - 1 do
-                for j = 0 to w - 1 do
-                  if db.(i).(j) > 0 then begin
-                    sum.(i).(j) <- sum.(i).(j) +. Float.of_int db.(i).(j);
-                    cnt.(i).(j) <- cnt.(i).(j) + 1
-                  end
-                done
-              done
-            ) db_list;
-            let out = Array.init h (fun i ->
-              Array.init w (fun j ->
-                if cnt.(i).(j) > 0
-                then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
-                else 0)) in
-            Some out
-          | AWS ->
-            let out = Array.init h (fun _ -> Array.make w 0) in
-            List.iter (fun db ->
-              for i = 0 to h - 1 do
-                for j = 0 to w - 1 do
-                  if db.(i).(j) > 0 then
-                    out.(i).(j) <- db.(i).(j)
-                done
-              done
-            ) db_list;
-            Some out
+          let frame = interleave_vv_vh ~hw vv_out vh_out in
+          let doy = doy_of_date_str date in
+          let orbits = List.sort_uniq String.compare (List.map (fun (si, _, _) -> si.orbit) loaded) in
+          S1_frames (List.map (fun o -> (o, doy, frame)) orbits)
         end
-      in
-
-      let vv_out = mosaic_pol (fun t -> t.st_vv) in
-      let vh_out = mosaic_pol (fun t -> t.st_vh) in
-      match vv_out, vh_out with
-      | None, None -> None
-      | _ ->
-        let vv = match vv_out with Some v -> v | None -> Array.init h (fun _ -> Array.make w 0) in
-        let vh = match vh_out with Some v -> v | None -> Array.init h (fun _ -> Array.make w 0) in
-        let combined = Array.init h (fun i ->
-          Array.init w (fun j -> [| Float.of_int vv.(i).(j); Float.of_int vh.(i).(j) |])) in
-        Some (group.sg_orbit, doy, combined)
-    ) (Array.of_list groups) in
-
-    let asc_data = ref [] in
-    let asc_doys = ref [] in
-    let desc_data = ref [] in
-    let desc_doys = ref [] in
-    Array.iter (fun opt -> match opt with
-      | Some (Some (orbit, doy, combined)) ->
-        if orbit = "ascending" then begin
-          asc_data := combined :: !asc_data;
-          asc_doys := doy :: !asc_doys
-        end else begin
-          desc_data := combined :: !desc_data;
-          desc_doys := doy :: !desc_doys
-        end
-      | _ -> ()
-    ) group_results;
-
-    (Array.of_list (List.rev !asc_data),
-     Array.of_list (List.rev !asc_doys),
-     Array.of_list (List.rev !desc_data),
-     Array.of_list (List.rev !desc_doys))
+      end in
+    let dates_arr = Array.of_list by_date in
+    let results = parallel_map ~n_workers load_date dates_arr in
+    let retry_idx = List.filter (fun i -> match results.(i) with S1_retry _ -> true | _ -> false)
+        (List.init (Array.length results) Fun.id) in
+    if retry_idx <> [] && research <> None then begin
+      let n_items = List.fold_left (fun acc i -> match results.(i) with
+        | S1_retry l -> acc + List.length l | _ -> acc) 0 retry_idx in
+      printf "  re-searching STAC for %d retry items with fresh signatures...\n%!" n_items;
+      let fresh = Array.of_list (List.map (fun i ->
+        let (date, date_items) = dates_arr.(i) in
+        let refreshed = refresh_items research date_items in
+        let date_items = List.filter_map (fun si ->
+          List.find_opt (fun r -> r.it.id = si.it.id) refreshed) date_items in
+        (date, date_items)) retry_idx) in
+      let rr = parallel_map ~n_workers (fun (date, date_items) ->
+        if date_items = [] then S1_unavailable else load_date (date, date_items)) fresh in
+      List.iteri (fun k i -> results.(i) <- rr.(k)) retry_idx
+    end;
+    let asc = ref [] and asc_d = ref [] and desc = ref [] and desc_d = ref [] in
+    let any_loaded = ref false in
+    Array.iter (fun r -> match r with
+      | S1_frames frames ->
+        any_loaded := true; cov.valid <- cov.valid + 1;
+        List.iter (fun (orbit, doy, frame) ->
+          if orbit = "ascending" then begin asc := frame :: !asc; asc_d := doy :: !asc_d end
+          else begin desc := frame :: !desc; desc_d := doy :: !desc_d end) frames
+      | S1_skipped -> any_loaded := true
+      | S1_retry _ -> cov.read_failed <- cov.read_failed + 1
+      | S1_unavailable -> cov.unavailable <- cov.unavailable + 1) results;
+    printf "  S1 coverage: %d valid, %d read-failed, %d unavailable of %d dates\n%!"
+      cov.valid cov.read_failed cov.unavailable cov.found;
+    if not !any_loaded then printf "  no usable S1 scenes -> proceeding S2-only\n%!";
+    (List.rev !asc, List.rev !asc_d, List.rev !desc, List.rev !desc_d, cov)
   end
 
 (* ======================== OPERA RTC-S1 (AWS) ======================== *)
+
+type s1_tile = { st_vv : string option; st_vh : string option }
+type s1_group = { sg_date : string; sg_orbit : string; sg_tiles : s1_tile list }
 
 let read_edl_token () =
   let token_path = Filename.concat (Sys.getenv "HOME") ".edl_bearer_token" in
@@ -614,14 +880,9 @@ let setup_opera_gdal_auth token =
   Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" header_path;
   eprintf "  GDAL OPERA auth configured\n%!"
 
-type opera_granule = {
-  og_date : string;
-  og_vv_url : string;
-  og_vh_url : string;
-}
+type opera_granule = { og_date : string; og_vv_url : string; og_vh_url : string }
 
-let search_cmr_opera ~(client : Stac_client.t)
-    ~bbox:(xmin, ymin, xmax, ymax) ~datetime =
+let search_cmr_opera ~(client : Stac_client.t) ~bbox:(xmin, ymin, xmax, ymax) ~datetime =
   let temporal =
     match String.split_on_char '/' datetime with
     | [s; e] ->
@@ -633,11 +894,9 @@ let search_cmr_opera ~(client : Stac_client.t)
   let rec fetch_all page_num acc =
     let url = Printf.sprintf
       "%s?collection_concept_id=%s&bounding_box=%s&temporal=%s&page_size=2000&page_num=%d"
-      cmr_url opera_collection_id bbox_str temporal page_num
-    in
+      cmr_url opera_collection_id bbox_str temporal page_num in
     let code, body = Stac_client.http_get client url in
-    if code <> 200 then
-      failwith (Printf.sprintf "CMR search failed (%d): %s" code body);
+    if code <> 200 then failwith (Printf.sprintf "CMR search failed (%d): %s" code body);
     let json = Yojson.Safe.from_string body in
     let entries = match json with
       | `Assoc fields ->
@@ -647,56 +906,39 @@ let search_cmr_opera ~(client : Stac_client.t)
             | Some (`List entries) -> entries
             | _ -> [])
          | _ -> [])
-      | _ -> []
-    in
+      | _ -> [] in
     if entries = [] then List.rev acc
     else begin
       let granules = List.filter_map (fun entry ->
         match entry with
         | `Assoc fields ->
           let time_start = match List.assoc_opt "time_start" fields with
-            | Some (`String s) -> date_of_datetime s
-            | _ -> ""
-          in
+            | Some (`String s) -> date_of_datetime s | _ -> "" in
           if time_start = "" then None
           else begin
             let title = match List.assoc_opt "title" fields with
-              | Some (`String s) -> s
-              | _ -> ""
-            in
+              | Some (`String s) -> s | _ -> "" in
             if title = "" then begin
-              eprintf "  Warning: skipping CMR entry without title\n%!";
-              None
+              eprintf "  Warning: skipping CMR entry without title\n%!"; None
             end else
               let base = Printf.sprintf
-                "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/%s/%s"
-                title title in
-              Some { og_date = time_start;
-                     og_vv_url = base ^ "_VV.tif";
-                     og_vh_url = base ^ "_VH.tif" }
+                "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/%s/%s" title title in
+              Some { og_date = time_start; og_vv_url = base ^ "_VV.tif"; og_vh_url = base ^ "_VH.tif" }
           end
-        | _ -> None
-      ) entries in
+        | _ -> None) entries in
       let acc = List.rev_append granules acc in
-      if List.length entries < 2000 then List.rev acc
-      else fetch_all (page_num + 1) acc
+      if List.length entries < 2000 then List.rev acc else fetch_all (page_num + 1) acc
     end
   in
   fetch_all 1 []
 
 let read_orbit_direction_from_cog url =
-  match Gdal.Dataset.open_ex ~thread_safe:true (gdal_vsi_path url) with
-  | Error _ ->
-    eprintf "  Warning: could not open COG for orbit metadata\n%!";
-    "unknown"
+  match Gdal.Dataset.open_ex (gdal_vsi_path url) with
+  | Error _ -> eprintf "  Warning: could not open COG for orbit metadata\n%!"; "unknown"
   | Ok ds ->
-    let result =
-      match Gdal.Dataset.get_metadata_item ds ~key:"ORBIT_PASS_DIRECTION" ~domain:"" with
-      | Some s -> String.lowercase_ascii s
-      | None -> "unknown"
-    in
-    Gdal.Dataset.close ds;
-    result
+    let result = match Gdal.Dataset.get_metadata_item ds ~key:"ORBIT_PASS_DIRECTION" ~domain:"" with
+      | Some s -> String.lowercase_ascii s | None -> "unknown" in
+    Gdal.Dataset.close ds; result
 
 let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
   eprintf "  Searching CMR for OPERA RTC-S1...\n%!";
@@ -707,10 +949,8 @@ let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
     let by_date = Hashtbl.create 64 in
     List.iter (fun g ->
       let prev = try Hashtbl.find by_date g.og_date with Not_found -> [] in
-      Hashtbl.replace by_date g.og_date (g :: prev)
-    ) granules;
-    let sorted_dates = List.sort String.compare
-      (Hashtbl.fold (fun k _ acc -> k :: acc) by_date []) in
+      Hashtbl.replace by_date g.og_date (g :: prev)) granules;
+    let sorted_dates = List.sort String.compare (Hashtbl.fold (fun k _ acc -> k :: acc) by_date []) in
     let groups = ref [] in
     List.iter (fun date_str ->
       let day_granules = List.rev (Hashtbl.find by_date date_str) in
@@ -718,96 +958,130 @@ let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
       List.iter (fun g ->
         let orbit = read_orbit_direction_from_cog g.og_vv_url in
         let prev = try Hashtbl.find by_orbit orbit with Not_found -> [] in
-        Hashtbl.replace by_orbit orbit (g :: prev)
-      ) day_granules;
+        Hashtbl.replace by_orbit orbit (g :: prev)) day_granules;
       Hashtbl.iter (fun orbit orbit_granules ->
-        let tiles = List.map (fun g ->
-          { st_vv = Some g.og_vv_url;
-            st_vh = Some g.og_vh_url }
-        ) orbit_granules in
-        groups := { sg_date = date_str; sg_orbit = orbit; sg_tiles = tiles } :: !groups
-      ) by_orbit
+        let tiles = List.map (fun g -> { st_vv = Some g.og_vv_url; st_vh = Some g.og_vh_url }) orbit_granules in
+        groups := { sg_date = date_str; sg_orbit = orbit; sg_tiles = tiles } :: !groups) by_orbit
     ) sorted_dates;
     List.rev !groups
   end
 
-(* ======================== NPY save helpers ======================== *)
+(** OPERA groups: one (date, orbit) per group, bilinear, last-valid-wins. *)
+let process_s1_opera ~(roi : roi) ~n_workers groups =
+  let hw = roi.height * roi.width in
+  if groups = [] then begin
+    printf "  No S1 data to process\n%!";
+    ([], [], [], [])
+  end else begin
+    printf "  Loading SAR data (%d groups)...\n%!" (List.length groups);
+    let results = parallel_map ~n_workers (fun group ->
+      let mosaic_pol get_url =
+        let db_list = List.filter_map (fun tile ->
+          match get_url tile with
+          | None -> None
+          | Some url ->
+            (try
+               let db = amplitude_to_db ~roi (flat2 (warp_read Gdal.BA_float32 ~roi ~resampling:"bilinear" url)) in
+               let has_any = ref false in
+               for p = 0 to hw - 1 do if Array1.unsafe_get db p > 0 then has_any := true done;
+               if !has_any then Some db else None
+             with Read_failure (_, m) ->
+               eprintf "  %s: skipped %s: %s\n%!" group.sg_date url m; None)
+        ) group.sg_tiles in
+        mosaic_last ~hw db_list in
+      let vv = mosaic_pol (fun t -> t.st_vv) and vh = mosaic_pol (fun t -> t.st_vh) in
+      if vv = None && vh = None then None
+      else Some (group.sg_orbit, doy_of_date_str group.sg_date, interleave_vv_vh ~hw vv vh)
+    ) (Array.of_list groups) in
+    let asc = ref [] and asc_d = ref [] and desc = ref [] and desc_d = ref [] in
+    Array.iter (function
+      | Some (orbit, doy, frame) ->
+        if orbit = "ascending" then begin asc := frame :: !asc; asc_d := doy :: !asc_d end
+        else begin desc := frame :: !desc; desc_d := doy :: !desc_d end
+      | None -> ()) results;
+    (List.rev !asc, List.rev !asc_d, List.rev !desc, List.rev !desc_d)
+  end
 
-(* Save bands.npy as uint16 (S2 sensor values fit in 0-65535) *)
-let save_bands path (f : flat_4d) =
-  let total = f.n * f.h * f.w * f.c in
-  let arr = Array.init total (fun i ->
-    let v = Array1.get f.data i in
-    Float.to_int (Float.max 0.0 (Float.min 65535.0 v))) in
-  Npy.save path (Npy.of_int_array Npy.Uint16 [| f.n; f.h; f.w; f.c |] arr)
+(* ======================== Coverage policy ======================== *)
 
-(* Save masks.npy as uint8 (0 or 1) *)
-let save_masks path (f : flat_3d_int) =
-  let total = f.n3 * f.h3 * f.w3 in
-  let arr = Array.init total (fun i -> Array1.get f.idata i) in
-  Npy.save path (Npy.of_int_array Npy.Uint8 [| f.n3; f.h3; f.w3 |] arr)
+exception All_scenes_dropped of string   (* permanent: mark cell bad *)
+exception Read_starved of string         (* transient: re-queue *)
 
-(* Save S2 doys as uint16 (day-of-year 1-366) *)
-let save_doys_uint16 path arr =
-  Npy.save path (Npy.of_int_array Npy.Uint16 [| Array.length arr |] arr)
+let apply_coverage_policy ~grid_id ~s2_min_load_frac ~s1_min_load_frac cov_s2 cov_s1 =
+  if cov_s2.found = 0 then
+    raise (All_scenes_dropped (Printf.sprintf "%s: no S2 STAC items (out of coverage)" grid_id));
+  if s2_min_load_frac > 0.0 && read_fail_frac cov_s2 > 1.0 -. s2_min_load_frac then
+    raise (Read_starved (Printf.sprintf "%s: S2 read-starved: %d/%d dates unreadable (throttled); re-queue"
+                           grid_id cov_s2.read_failed cov_s2.found));
+  if cov_s2.valid = 0 && cov_s2.read_failed = 0 && cov_s2.cloud = 0 then
+    raise (All_scenes_dropped (Printf.sprintf "%s: all %d S2 dates genuinely absent" grid_id cov_s2.unavailable));
+  if s1_min_load_frac > 0.0 && read_fail_frac cov_s1 > 1.0 -. s1_min_load_frac then
+    raise (Read_starved (Printf.sprintf "%s: S1 read-starved: %d/%d dates unreadable (throttled); re-queue"
+                           grid_id cov_s1.read_failed cov_s1.found))
 
-(* Save SAR data as int16 (dB-scaled values fit in 0-32767) *)
-let save_sar path (f : flat_4d) =
-  let total = f.n * f.h * f.w * f.c in
-  let arr = Array.init total (fun i ->
-    Float.to_int (Array1.get f.data i)) in
-  Npy.save path (Npy.of_int_array Npy.Int16 [| f.n; f.h; f.w; f.c |] arr)
+(* ======================== NPY output ======================== *)
 
-(* Save SAR doys as int16 *)
-let save_doys_int16 path arr =
-  Npy.save path (Npy.of_int_array Npy.Int16 [| Array.length arr |] arr)
+(** Little-endian encoders for one frame. *)
+let bytes_of_u16 (a : u16) =
+  let n = Array1.dim a in
+  let b = Bytes.create (2 * n) in
+  for i = 0 to n - 1 do Bytes.set_uint16_le b (2 * i) (Array1.unsafe_get a i) done; b
+
+let bytes_of_i16 (a : i16) =
+  let n = Array1.dim a in
+  let b = Bytes.create (2 * n) in
+  for i = 0 to n - 1 do Bytes.set_int16_le b (2 * i) (Array1.unsafe_get a i) done; b
+
+let bytes_of_u8 (a : u8) =
+  let n = Array1.dim a in
+  let b = Bytes.create n in
+  for i = 0 to n - 1 do Bytes.set_uint8 b i (Array1.unsafe_get a i) done; b
+
+(** Write frames as one C-order array of shape (n_frames :: frame_shape). *)
+let save_frames path dtype frame_shape encode frames =
+  let oc = open_out_bin path in
+  Npy.write_header oc dtype (Array.append [| List.length frames |] frame_shape);
+  List.iter (fun f -> output_bytes oc (encode f)) frames;
+  close_out oc
+
+let save_doys path dtype (doys : int list) =
+  let arr = Array.of_list doys in
+  Npy.save path (Npy.of_int_array dtype [| Array.length arr |] arr)
 
 (* ======================== OmniCloudMask ======================== *)
 
-(** Per-channel normalize a (3, H, W) float32 bigarray in-place style.
+(** Per-channel normalize a (3, H, W) float32 bigarray.
     For each channel: compute mean/std of non-zero pixels, normalize non-zero,
     leave zeros as 0.0. Returns a new bigarray. *)
-let channel_norm_3chw ~h ~w
-    (src : (float, float32_elt, c_layout) Array1.t) =
+let channel_norm_3chw ~h ~w (src : (float, float32_elt, c_layout) Array1.t) =
   let out = Array1.create float32 c_layout (3 * h * w) in
   Array1.fill out 0.0;
   for c = 0 to 2 do
     let base = c * h * w in
-    (* First pass: mean of non-zero *)
     let sum = ref 0.0 in
     let cnt = ref 0 in
     for k = 0 to h * w - 1 do
       let v = Array1.get src (base + k) in
-      if v <> 0.0 then begin
-        sum := !sum +. v;
-        incr cnt
-      end
+      if v <> 0.0 then begin sum := !sum +. v; incr cnt end
     done;
     if !cnt > 0 then begin
       let mean = !sum /. Float.of_int !cnt in
-      (* Second pass: std *)
       let sq_sum = ref 0.0 in
       for k = 0 to h * w - 1 do
         let v = Array1.get src (base + k) in
-        if v <> 0.0 then begin
-          let d = v -. mean in
-          sq_sum := !sq_sum +. d *. d
-        end
+        if v <> 0.0 then begin let d = v -. mean in sq_sum := !sq_sum +. d *. d end
       done;
       let std = Float.sqrt (!sq_sum /. Float.of_int !cnt) in
       let std = if std = 0.0 then 1.0 else std in
-      (* Third pass: normalize *)
       for k = 0 to h * w - 1 do
         let v = Array1.get src (base + k) in
-        if v <> 0.0 then
-          Array1.set out (base + k) ((v -. mean) /. std)
+        if v <> 0.0 then Array1.set out (base + k) ((v -. mean) /. std)
       done
     end
   done;
   out
 
-(** Generate overlapping patch coordinates.
-    Returns list of (top, bottom, left, right). *)
+(** Generate overlapping patch coordinates. Returns list of (top, bottom, left, right). *)
 let make_patch_indexes ~array_height ~array_width ~patch_size ~patch_overlap =
   let stride = patch_size - patch_overlap in
   let max_bottom = array_height - patch_size in
@@ -828,28 +1102,23 @@ let make_patch_indexes ~array_height ~array_width ~patch_size ~patch_overlap =
   done;
   List.rev !patches
 
-(** Create gradient blending mask (patch_size x patch_size) as flat float32 bigarray.
-    Matches Python create_gradient_mask exactly. *)
+(** Create gradient blending mask (patch_size x patch_size) as flat float32 bigarray. *)
 let create_gradient_mask ~patch_size ~patch_overlap =
   let ps = patch_size in
   let po = if patch_overlap * 2 > ps then ps / 2 else patch_overlap in
   let grad = Array1.create float32 c_layout (ps * ps) in
   if po > 0 then begin
-    (* horizontal gradient: columns *)
     let fpo = Float.of_int po in
     for i = 0 to ps - 1 do
       for j = 0 to ps - 1 do
         let h_val =
           if j < po then Float.of_int (j + 1) /. fpo
           else if j >= ps - po then Float.of_int (ps - j) /. fpo
-          else 1.0
-        in
-        (* vertical gradient: rows (= rotated horizontal) *)
+          else 1.0 in
         let v_val =
           if i < po then Float.of_int (i + 1) /. fpo
           else if i >= ps - po then Float.of_int (ps - i) /. fpo
-          else 1.0
-        in
+          else 1.0 in
         Array1.set grad (i * ps + j) (h_val *. v_val)
       done
     done
@@ -862,31 +1131,20 @@ let create_gradient_mask ~patch_size ~patch_overlap =
 let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
     (norm_img : (float, float32_elt, c_layout) Array1.t) =
   let ps = patch_size in
-  let patches = make_patch_indexes ~array_height:h ~array_width:w
-      ~patch_size:ps ~patch_overlap in
+  let patches = make_patch_indexes ~array_height:h ~array_width:w ~patch_size:ps ~patch_overlap in
   let gradient = create_gradient_mask ~patch_size:ps ~patch_overlap in
-
-  (* Accumulators: (4, H, W) predictions and (H, W) weight sums *)
   let pred = Array1.create float32 c_layout (4 * h * w) in
   Array1.fill pred 0.0;
   let wsum = Array1.create float32 c_layout (h * w) in
   Array1.fill wsum 0.0;
-
-  (* Deduplicate patches *)
   let seen = Hashtbl.create 256 in
   let unique_patches = List.filter (fun idx ->
-    if Hashtbl.mem seen idx then false
-    else begin Hashtbl.replace seen idx (); true end
-  ) patches in
-
-  (* Process in batches *)
+    if Hashtbl.mem seen idx then false else begin Hashtbl.replace seen idx (); true end) patches in
   let patch_arr = Array.of_list unique_patches in
   let n_patches = Array.length patch_arr in
   let batch_idx = ref 0 in
   while !batch_idx < n_patches do
     let actual_b = min batch_size (n_patches - !batch_idx) in
-
-    (* Extract patches into (B, 3, ps, ps) flat bigarray *)
     let patch_ba = Array1.create float32 c_layout (actual_b * 3 * ps * ps) in
     Array1.fill patch_ba 0.0;
     for b = 0 to actual_b - 1 do
@@ -902,29 +1160,18 @@ let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
         done
       done
     done;
-
-    (* Check if entire batch is zeros — skip if so *)
     let all_zero = ref true in
     for k = 0 to Array1.dim patch_ba - 1 do
       if Array1.get patch_ba k <> 0.0 then all_zero := false
     done;
-
     if not !all_zero then begin
-      (* Run both models *)
-      let shape = [| Int64.of_int actual_b; 3L;
-                     Int64.of_int ps; Int64.of_int ps |] in
+      let shape = [| Int64.of_int actual_b; 3L; Int64.of_int ps; Int64.of_int ps |] in
       let out_size = actual_b * 4 * ps * ps in
-      let out1 = Onnxruntime.Session.run_ba sess1
-        [| ("input", patch_ba, shape) |]
-        [| "output" |]
-        ~output_sizes:[| out_size |] in
-      let out2 = Onnxruntime.Session.run_ba sess2
-        [| ("input", patch_ba, shape) |]
-        [| "output" |]
-        ~output_sizes:[| out_size |] in
+      let out1 = Onnxruntime.Session.run_ba sess1 [| ("input", patch_ba, shape) |] [| "output" |]
+          ~output_sizes:[| out_size |] in
+      let out2 = Onnxruntime.Session.run_ba sess2 [| ("input", patch_ba, shape) |] [| "output" |]
+          ~output_sizes:[| out_size |] in
       let o1 = out1.(0) and o2 = out2.(0) in
-
-      (* Average and accumulate with gradient blending *)
       for b = 0 to actual_b - 1 do
         let (top, _bottom, left, _right) = patch_arr.(!batch_idx + b) in
         for cls = 0 to 3 do
@@ -939,7 +1186,6 @@ let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
             done
           done
         done;
-        (* Accumulate gradient weights *)
         for pi = 0 to ps - 1 do
           for pj = 0 to ps - 1 do
             let gw = Array1.get gradient (pi * ps + pj) in
@@ -950,11 +1196,8 @@ let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
         done
       done
     end;
-
     batch_idx := !batch_idx + actual_b
   done;
-
-  (* Argmax over 4 classes → (H, W) int array *)
   let result = Array.make (h * w) 0 in
   for i = 0 to h - 1 do
     for j = 0 to w - 1 do
@@ -973,81 +1216,67 @@ let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
   done;
   result
 
-(** Run OmniCloudMask on all timesteps. Returns flat (T*H*W) int array for mask_optimized. *)
+(** Run OmniCloudMask on all timesteps. Returns one (H*W) uint8 frame per timestep. *)
 let run_ocm ~model1_path ~model2_path ~n_threads ~cuda_device
-    ~patch_size ~patch_overlap ~batch_size
-    ~(s2_bands_data : flat_4d) ~(s2_masks_data : flat_3d_int) =
-  let n_t = s2_bands_data.n in
-  let h = s2_bands_data.h and w = s2_bands_data.w in
-  Printf.printf "  OCM: %d timesteps, %dx%d\n%!" n_t h w;
-
+    ~patch_size ~patch_overlap ~batch_size ~h ~w
+    (bands : u16 list) (masks : u8 list) : u8 list =
+  let n_t = List.length bands in
+  printf "  OCM: %d timesteps, %dx%d\n%!" n_t h w;
   let env = Onnxruntime.Env.create ~log_level:3 "ocm" in
   let cuda_opt = if cuda_device >= 0 then Some cuda_device else None in
   let sess1 = Onnxruntime.Session.create env ~threads:n_threads ?cuda_device:cuda_opt model1_path in
   let sess2 = Onnxruntime.Session.create env ~threads:n_threads ?cuda_device:cuda_opt model2_path in
-
-  (* Auto patch size *)
   let ps = if patch_size <= 0 then min 1000 (min h w) else patch_size in
   let ps = max ps 32 in
   let po = min patch_overlap (ps / 2) in
-  Printf.printf "  OCM patch_size=%d, overlap=%d, batch_size=%d\n%!" ps po batch_size;
-
-  let mask_opt = Array.make (n_t * h * w) 0 in
-
-  for t = 0 to n_t - 1 do
-    (* Extract R(B04=idx0), G(B03=idx2), NIR(B8A=idx4) into (3, H, W) float32 *)
-    let rgn = Array1.create float32 c_layout (3 * h * w) in
+  printf "  OCM patch_size=%d, overlap=%d, batch_size=%d\n%!" ps po batch_size;
+  let hw = h * w in
+  List.mapi (fun t (band_frame, mask_frame) ->
+    (* R(B04=idx0), G(B03=idx2), NIR(B8A=idx4) into (3, H, W) float32 *)
+    let rgn = Array1.create float32 c_layout (3 * hw) in
     let band_indices = [| 0; 2; 4 |] in
     for c = 0 to 2 do
       let bi = band_indices.(c) in
-      for i = 0 to h - 1 do
-        for j = 0 to w - 1 do
-          let src_idx = ((t * h + i) * w + j) * 10 + bi in
-          let v = Array1.get s2_bands_data.data src_idx in
-          Array1.set rgn (c * h * w + i * w + j) v
-        done
+      for p = 0 to hw - 1 do
+        Array1.set rgn (c * hw + p) (Float.of_int (Array1.get band_frame (p * 10 + bi)))
       done
     done;
-
-    (* Channel normalize *)
     let norm = channel_norm_3chw ~h ~w rgn in
-
-    (* Run OCM *)
-    let ocm_class = run_ocm_on_image ~sess1 ~sess2 ~h ~w
-        ~patch_size:ps ~patch_overlap:po ~batch_size norm in
-
-    (* Merge: mask_optimized[t] = (scl_mask==1) AND (ocm_class==0) AND (not all-zero) *)
-    for i = 0 to h - 1 do
-      for j = 0 to w - 1 do
-        let px = i * w + j in
-        let scl_valid = Array1.get s2_masks_data.idata (t * h * w + px) = 1 in
-        let ocm_clear = ocm_class.(px) = 0 in
-        (* Check if all 3 channels are zero (nodata) *)
-        let all_zero =
-          Array1.get rgn (0 * h * w + px) = 0.0 &&
-          Array1.get rgn (1 * h * w + px) = 0.0 &&
-          Array1.get rgn (2 * h * w + px) = 0.0 in
-        if scl_valid && ocm_clear && not all_zero then
-          mask_opt.(t * h * w + px) <- 1
-      done
+    let ocm_class = run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size:ps ~patch_overlap:po ~batch_size norm in
+    let out : u8 = Array1.create int8_unsigned c_layout hw in
+    for p = 0 to hw - 1 do
+      let scl_valid = Array1.get mask_frame p = 1 in
+      let ocm_clear = ocm_class.(p) = 0 in
+      let all_zero = Array1.get rgn p = 0.0 && Array1.get rgn (hw + p) = 0.0
+                     && Array1.get rgn (2 * hw + p) = 0.0 in
+      Array1.set out p (if scl_valid && ocm_clear && not all_zero then 1 else 0)
     done;
-
-    if (t + 1) mod 10 = 0 || t = n_t - 1 then
-      Printf.printf "  [%d/%d] timesteps processed\n%!" (t + 1) n_t
-  done;
-  { idata = Array1.of_array int c_layout mask_opt;
-    n3 = n_t; h3 = h; w3 = w }
+    if (t + 1) mod 10 = 0 || t = n_t - 1 then printf "  [%d/%d] timesteps processed\n%!" (t + 1) n_t;
+    out) (List.combine bands masks)
 
 (* ======================== Main ======================== *)
 
 let () =
-  let input_tiff = ref "" in
+  let grid_id_arg = ref "" in
+  let window_arg = ref "" in
+  let shard_arg = ref "" in
+  let shard_px = ref 4096 in
+  let subwindow = ref 1024 in
+  let zone_grid_arg = ref "" in
   let output_dir = ref "" in
   let start_date = ref "2024-01-01" in
   let end_date = ref "2024-12-31" in
   let max_cloud = ref 100.0 in
   let data_source_str = ref "mpc" in
-  let download_workers = ref 32 in
+  (* Per-instance concurrency of COG reads: the same lever as dask
+     num_workers / --download-workers / DOWNLOAD_WORKERS in the Python stack
+     (build_tile.py uses 4; the fleet notes keep DL=4 per worker so many
+     instances do not trip MPC throttling). Total CPU threads per instance is
+     about download_workers x GDAL_NUM_THREADS (GDAL_NUM_THREADS unset = 1). *)
+  let download_workers = ref (env_int "DOWNLOAD_WORKERS" 4) in
+  let s2_min_load_frac = ref (env_float "S2_MIN_LOAD_FRAC" 0.9) in
+  let s1_min_load_frac = ref (env_float "S1_MIN_LOAD_FRAC" 0.9) in
+  let no_research = ref false in
   let ocm_model_1 = ref "" in
   let ocm_model_2 = ref "" in
   let ocm_patch_size = ref 0 in
@@ -1055,23 +1284,33 @@ let () =
   let ocm_patch_overlap = ref 300 in
   let ocm_threads = ref 4 in
   let flat_output = ref false in
+  let layout = ref "nested" in
   let cuda_device = ref (-1) in
 
   let speclist = [
-    ("--input_tiff", Arg.Set_string input_tiff, "Path to grid GeoTIFF");
+    ("--grid_id", Arg.Set_string grid_id_arg, "Grid id, e.g. grid_51.05_10.35 (tile geometry is derived from it)");
+    ("--window", Arg.Set_string window_arg, "Grid-aligned window ZONE:ROW:COL:HxW in zone-grid pixels (needs --zone_grid)");
+    ("--shard", Arg.Set_string shard_arg, "Zarr shard ZONE:SR:SC: run every --subwindow sub-window of it in turn (needs --zone_grid)");
+    ("--shard_px", Arg.Set_int shard_px, "Shard side in pixels (default 4096)");
+    ("--subwindow", Arg.Set_int subwindow, "Sub-window side for --shard; must divide --shard_px (default 1024)");
+    ("--zone_grid", Arg.Set_string zone_grid_arg, "Zone grid JSON: a zone_grids.json dump or a genesis /work document");
     ("--output", Arg.Set_string output_dir, "Output directory for dpixel .npy files");
     ("--start", Arg.Set_string start_date, "Start date (YYYY-MM-DD)");
     ("--end", Arg.Set_string end_date, "End date (YYYY-MM-DD)");
-    ("--max_cloud", Arg.Set_float max_cloud, "Max cloud cover %");
+    ("--max_cloud", Arg.Set_float max_cloud, "Max cloud cover % (default: 100)");
     ("--data_source", Arg.Set_string data_source_str, "Data source: mpc or aws (default: mpc)");
-    ("--download_workers", Arg.Set_int download_workers, "Parallel GDAL download workers (default: 32)");
+    ("--download_workers", Arg.Set_int download_workers, "Concurrent COG reads (domains); default $DOWNLOAD_WORKERS or 4");
+    ("--s2_min_load_frac", Arg.Set_float s2_min_load_frac, "Min fraction of S2 dates that must load, else exit 3; default $S2_MIN_LOAD_FRAC or 0.9 (0 disables)");
+    ("--s1_min_load_frac", Arg.Set_float s1_min_load_frac, "Min fraction of S1 dates that must load, else exit 3; default $S1_MIN_LOAD_FRAC or 0.9 (0 disables)");
+    ("--no_research", Arg.Set no_research, "Do not re-search STAC for fresh signed URLs on read failures");
     ("--ocm_model_1", Arg.Set_string ocm_model_1, "Path to first OCM ONNX model (OCM skipped if not set)");
     ("--ocm_model_2", Arg.Set_string ocm_model_2, "Path to second OCM ONNX model (OCM skipped if not set)");
     ("--ocm_patch_size", Arg.Set_int ocm_patch_size, "OCM patch size, 0=auto (default: 0)");
     ("--ocm_batch_size", Arg.Set_int ocm_batch_size, "OCM patches per batch (default: 16)");
     ("--ocm_patch_overlap", Arg.Set_int ocm_patch_overlap, "OCM overlap pixels (default: 300)");
     ("--ocm_threads", Arg.Set_int ocm_threads, "OCM ONNX Runtime threads (default: 4)");
-    ("--flat_output", Arg.Set flat_output, "Write .npy files directly to --output (no subdirectory)");
+    ("--flat_output", Arg.Set flat_output, "Write into --output directly instead of --output/<grid_id>");
+    ("--layout", Arg.Set_string layout, "nested: s2/ and s1/ subdirectories as dpixel.py (default); flat: all .npy in one directory");
     ("--cuda", Arg.Set_int cuda_device, "CUDA device ID (e.g. 0) for GPU OCM inference");
   ] in
   Arg.parse speclist (fun _ -> ()) "Tessera dpixel download tool";
@@ -1079,49 +1318,92 @@ let () =
   let data_source = match String.lowercase_ascii !data_source_str with
     | "mpc" -> MPC
     | "aws" -> AWS
-    | s -> failwith (Printf.sprintf "Unknown data source: %s (expected mpc or aws)" s)
-  in
-
-  if !input_tiff = "" then failwith "--input_tiff is required";
+    | s -> failwith (Printf.sprintf "Unknown data source: %s (expected mpc or aws)" s) in
+  let nested = match String.lowercase_ascii !layout with
+    | "nested" -> true | "flat" -> false
+    | s -> failwith (Printf.sprintf "Unknown layout: %s (expected nested or flat)" s) in
+  let n_given = List.length (List.filter (fun r -> !r <> "") [ grid_id_arg; window_arg; shard_arg ]) in
+  if n_given <> 1 then failwith "exactly one of --grid_id, --window or --shard is required";
+  if (!window_arg <> "" || !shard_arg <> "") && !zone_grid_arg = "" then
+    failwith "--window and --shard need --zone_grid";
+  if !shard_px mod !subwindow <> 0 then failwith "--subwindow must divide --shard_px";
   if !output_dir = "" then failwith "--output is required";
 
-  let grid_id = Filename.remove_extension (Filename.basename !input_tiff) in
   let date_range = !start_date ^ "/" ^ !end_date in
-  let out_dir = if !flat_output then !output_dir
-                else Filename.concat !output_dir grid_id in
 
-  (* Skip if already complete *)
-  if Sys.file_exists (Filename.concat out_dir "bands.npy") then begin
-    Printf.printf "Output already exists: %s\nSkipping.\n%!" out_dir;
-    exit 0
-  end;
-
-  let t_start = Unix.gettimeofday () in
-  Printf.printf "\nDpixel download started: %s\n%!" grid_id;
+  Gdal.init ();
+  (* GDAL HTTP tuning for remote COG access (stackstac's defaults plus retries);
+     anything already set in the environment takes precedence. *)
+  set_config_default "GDAL_DISABLE_READDIR_ON_OPEN" "EMPTY_DIR";
+  set_config_default "GDAL_HTTP_MULTIRANGE" "YES";
+  set_config_default "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" "YES";
+  set_config_default "GDAL_HTTP_MAX_RETRY" "3";
+  set_config_default "GDAL_HTTP_RETRY_DELAY" "1";
 
   let n_workers = !download_workers in
+  if n_workers > max_domains then
+    eprintf "  Note: --download_workers %d capped to %d (OCaml domain limit)\n%!" n_workers max_domains;
+  printf "  download_workers=%d GDAL_NUM_THREADS=%s\n%!" (min n_workers max_domains)
+    (Option.value (Sys.getenv_opt "GDAL_NUM_THREADS") ~default:"unset (1)");
   let client = Stac_client.make () in
-  let roi = load_roi !input_tiff in
-  Printf.printf "  Tile: %dx%d, resolution=%.6f\n%!" roi.height roi.width roi.resolution;
+
+  (* The units of work: a 0.1 degree tile, one zone-grid window, or every
+     sub-window of a Zarr shard (the PoC's decomposition: the shard is the
+     write unit, the sub-window the memory unit). Each is named as the
+     uploader expects: grid_<lon>_<lat> or utmZZ/r<row>c<col>. *)
+  let window_id zone row col = Printf.sprintf "utm%02d/r%dc%d" zone row col in
+  let jobs : (string * roi) list =
+    if !grid_id_arg <> "" then begin
+      match parse_grid_id !grid_id_arg with
+      | Some (lon, lat) -> [ (!grid_id_arg, roi_of_grid lon lat) ]
+      | None -> failwith (Printf.sprintf "%s is not of the form grid_<lon>_<lat>" !grid_id_arg)
+    end else if !window_arg <> "" then begin
+      match parse_window !window_arg with
+      | Some (zone, row, col, h, w) ->
+        [ (window_id zone row col, roi_of_window (zone_grid_of_file !zone_grid_arg zone) ~row ~col ~h ~w) ]
+      | None -> failwith (Printf.sprintf "%s is not of the form ZONE:ROW:COL:HxW" !window_arg)
+    end else begin
+      match String.split_on_char ':' !shard_arg with
+      | [ z; r; c ] ->
+        let zone = int_of_string z and sr = int_of_string r and sc = int_of_string c in
+        let g = zone_grid_of_file !zone_grid_arg zone in
+        let n = !subwindow and sp = !shard_px in
+        let subs = List.concat_map (fun dr ->
+          List.filter_map (fun dc ->
+            let row = sr * sp + dr * n and col = sc * sp + dc * n in
+            let h = min n (g.zg_height_px - row) and w = min n (g.zg_width_px - col) in
+            if h <= 0 || w <= 0 then None
+            else Some (window_id zone row col, roi_of_window g ~row ~col ~h ~w))
+            (List.init (sp / n) Fun.id)) (List.init (sp / n) Fun.id) in
+        if subs = [] then failwith (Printf.sprintf "shard %s lies outside the zone %02d grid" !shard_arg zone);
+        printf "shard %s: %d sub-windows of %dx%d\n%!" !shard_arg (List.length subs) n n;
+        subs
+      | _ -> failwith (Printf.sprintf "%s is not of the form ZONE:SR:SC" !shard_arg)
+    end in
+
+  let run_job grid_id (roi : roi) =
+  let out_dir = if !flat_output then !output_dir else Filename.concat !output_dir grid_id in
+  let s2_dir = if nested then Filename.concat out_dir "s2" else out_dir in
+  let s1_dir = if nested then Filename.concat out_dir "s1" else out_dir in
+  if Sys.file_exists (Filename.concat s2_dir "bands.npy") then
+    printf "Output already exists: %s\nSkipping.\n%!" out_dir
+  else begin
+  let t_start = Unix.gettimeofday () in
+  printf "\nDpixel download started: %s\n%!" grid_id;
+  let (minx, miny, maxx, maxy) = roi.grid_bounds in
+  printf "  ROI %dx%d (warp grid %dx%d) %s bounds=(%.0f %.0f %.0f %.0f) res=%.1f\n%!"
+    roi.height roi.width roi.h_out roi.w_out roi.dst_srs minx miny maxx maxy roi.resolution;
   let (xmin, ymin, xmax, ymax) = roi.bbox in
 
-  (* GDAL HTTP tuning for remote COG access *)
-  Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" "EMPTY_DIR";
-  Gdal.set_config_option "GDAL_HTTP_MULTIRANGE" "YES";
-  Gdal.set_config_option "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" "YES";
-  Gdal.set_config_option "GDAL_HTTP_MULTIPLEX" "YES";
-  Gdal.set_config_option "GDAL_HTTP_VERSION" "2";
-  Gdal.set_config_option "CPL_VSIL_CURL_CACHE_SIZE" "134217728";
-  Gdal.set_config_option "GDAL_HTTP_MAX_RETRY" "3";
-  Gdal.set_config_option "GDAL_HTTP_RETRY_DELAY" "1";
+  let sign items = match data_source with
+    | MPC -> with_retries ~label:"SAS signing" (fun () ->
+               List.map (Stac_client.sign_planetary_computer client) items)
+    | AWS -> items in
 
   (* Sentinel-2 *)
-  let s2_base_url = match data_source with
-    | MPC -> stac_url
-    | AWS -> aws_stac_url
-  in
+  let s2_base_url = match data_source with MPC -> stac_url | AWS -> aws_stac_url in
   let t_s2_start = Unix.gettimeofday () in
-  Printf.printf "\nSearching Sentinel-2 [%s] (%s)...\n%!"
+  printf "\nSearching Sentinel-2 [%s] (%s)...\n%!"
     (match data_source with MPC -> "MPC" | AWS -> "AWS") date_range;
   let s2_params : Stac_client.search_params = {
     collections = ["sentinel-2-l2a"];
@@ -1130,21 +1412,21 @@ let () =
     query = Some (`Assoc ["eo:cloud_cover", `Assoc ["lt", `Float !max_cloud]]);
     limit = None;
   } in
-  let s2_items = Stac_client.search client ~base_url:s2_base_url s2_params in
-  Printf.printf "  Found %d scenes\n%!" (List.length s2_items);
-  Printf.printf "Processing Sentinel-2 (workers=%d)...\n%!" n_workers;
-  let (s2b, s2m, s2d) = process_s2 ~roi ~client ~data_source ~n_workers s2_items in
-  let s2_bands_data = flatten_4d s2b in
-  let s2_masks_data = flatten_3d_int s2m in
-  let s2_doys_data = s2d in
-  let t_s2_end = Unix.gettimeofday () in
-  Printf.printf "  Result: %d valid days (%.1fs)\n%!" (Array.length s2b) (t_s2_end -. t_s2_start);
+  let search_s2 () = sign (with_retries ~label:"S2 STAC search"
+                             (fun () -> Stac_client.search client ~base_url:s2_base_url s2_params)) in
+  let s2_items = search_s2 () in
+  printf "  Found %d scenes\n%!" (List.length s2_items);
+  printf "Processing Sentinel-2 (workers=%d)...\n%!" n_workers;
+  let research_s2 = memoize_research (if !no_research then None else Some search_s2) in
+  let (s2_bands, s2_masks, s2_doys, cov_s2) =
+    process_s2 ~roi ~data_source ~n_workers ~research:research_s2 (List.map s_item_of s2_items) in
+  printf "  Result: %d valid days (%.1fs)\n%!" (List.length s2_bands) (Unix.gettimeofday () -. t_s2_start);
 
   (* Sentinel-1 *)
   let t_s1_start = Unix.gettimeofday () in
-  Printf.printf "\nSearching Sentinel-1 [%s] (%s)...\n%!"
+  printf "\nSearching Sentinel-1 [%s] (%s)...\n%!"
     (match data_source with MPC -> "MPC" | AWS -> "AWS/OPERA") date_range;
-  let s1_groups = match data_source with
+  let (s1a, s1ad, s1de, s1dd, cov_s1) = match data_source with
     | MPC ->
       let s1_params : Stac_client.search_params = {
         collections = ["sentinel-1-rtc"];
@@ -1153,65 +1435,72 @@ let () =
         query = None;
         limit = None;
       } in
-      let s1_items = Stac_client.search client ~base_url:stac_url s1_params in
-      Printf.printf "  Found %d scenes\n%!" (List.length s1_items);
-      prepare_s1_mpc ~client s1_items
+      let search_s1 () = sign (with_retries ~label:"S1 STAC search"
+                                 (fun () -> Stac_client.search client ~base_url:stac_url s1_params)) in
+      let s1_items = search_s1 () in
+      printf "  Found %d scenes\n%!" (List.length s1_items);
+      printf "Processing Sentinel-1 (workers=%d)...\n%!" n_workers;
+      let research_s1 = memoize_research (if !no_research then None else Some search_s1) in
+      process_s1_mpc ~roi ~n_workers ~research:research_s1 (List.map s_item_of s1_items)
     | AWS ->
       let token = read_edl_token () in
       setup_opera_gdal_auth token;
-      prepare_s1_opera ~client
-        ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range
-  in
-  Printf.printf "Processing Sentinel-1 (%d groups, workers=%d)...\n%!" (List.length s1_groups) n_workers;
-  let (s1a, s1ad, s1de, s1dd) = process_s1_groups ~roi ~n_workers ~data_source s1_groups in
-  (if data_source = AWS then
-    Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" "");
-  let s1_asc_data = flatten_4d s1a in
-  let s1_asc_doy_data = s1ad in
-  let s1_desc_data = flatten_4d s1de in
-  let s1_desc_doy_data = s1dd in
-  let t_s1_end = Unix.gettimeofday () in
-  Printf.printf "  Ascending: %d passes, Descending: %d passes (%.1fs)\n%!"
-    (Array.length s1a) (Array.length s1de) (t_s1_end -. t_s1_start);
+      let groups = prepare_s1_opera ~client ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range in
+      printf "Processing Sentinel-1 (%d groups, workers=%d)...\n%!" (List.length groups) n_workers;
+      let (a, ad, d, dd) = process_s1_opera ~roi ~n_workers groups in
+      Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" "";
+      let cov = new_coverage () in
+      cov.found <- List.length groups; cov.valid <- List.length a + List.length d;
+      (a, ad, d, dd, cov) in
+  printf "  Ascending: %d passes, Descending: %d passes (%.1fs)\n%!"
+    (List.length s1a) (List.length s1de) (Unix.gettimeofday () -. t_s1_start);
+
+  (* One coverage policy decides accept / re-queue / mark-bad *)
+  apply_coverage_policy ~grid_id ~s2_min_load_frac:!s2_min_load_frac
+    ~s1_min_load_frac:!s1_min_load_frac cov_s2 cov_s1;
 
   (* Save dpixel .npy files *)
-  mkdir_p out_dir;
-  Printf.printf "\nSaving dpixel data to %s\n%!" out_dir;
-  save_bands (Filename.concat out_dir "bands.npy") s2_bands_data;
-  save_masks (Filename.concat out_dir "masks.npy") s2_masks_data;
-  save_doys_uint16 (Filename.concat out_dir "doys.npy") s2_doys_data;
-  save_sar (Filename.concat out_dir "sar_ascending.npy") s1_asc_data;
-  save_doys_int16 (Filename.concat out_dir "sar_ascending_doy.npy") s1_asc_doy_data;
-  save_sar (Filename.concat out_dir "sar_descending.npy") s1_desc_data;
-  save_doys_int16 (Filename.concat out_dir "sar_descending_doy.npy") s1_desc_doy_data;
+  mkdir_p s2_dir; mkdir_p s1_dir;
+  printf "\nSaving dpixel data to %s\n%!" out_dir;
+  let h = roi.height and w = roi.width in
+  save_frames (Filename.concat s2_dir "bands.npy") Npy.Uint16 [| h; w; 10 |] bytes_of_u16 s2_bands;
+  save_frames (Filename.concat s2_dir "masks.npy") Npy.Uint8 [| h; w |] bytes_of_u8 s2_masks;
+  save_doys (Filename.concat s2_dir "doys.npy") Npy.Uint16 s2_doys;
+  save_frames (Filename.concat s1_dir "sar_ascending.npy") Npy.Int16 [| h; w; 2 |] bytes_of_i16 s1a;
+  save_doys (Filename.concat s1_dir "sar_ascending_doy.npy") Npy.Int16 s1ad;
+  save_frames (Filename.concat s1_dir "sar_descending.npy") Npy.Int16 [| h; w; 2 |] bytes_of_i16 s1de;
+  save_doys (Filename.concat s1_dir "sar_descending_doy.npy") Npy.Int16 s1dd;
+  printf "  Saved 7 .npy files\n%!";
 
-  Printf.printf "  Saved 7 .npy files\n%!";
-
-  (* OmniCloudMask — only run if both model paths were supplied *)
+  (* OmniCloudMask: only if both model paths were supplied *)
   if !ocm_model_1 <> "" && !ocm_model_2 <> "" then begin
-    if not (Sys.file_exists !ocm_model_1) then
-      failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_1);
-    if not (Sys.file_exists !ocm_model_2) then
-      failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_2);
-    if s2_bands_data.n > 0 then begin
-      Printf.printf "\nRunning OmniCloudMask...\n%!";
+    if not (Sys.file_exists !ocm_model_1) then failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_1);
+    if not (Sys.file_exists !ocm_model_2) then failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_2);
+    if s2_bands <> [] then begin
+      printf "\nRunning OmniCloudMask...\n%!";
       let t_ocm_start = Unix.gettimeofday () in
-      let mask_opt = run_ocm
-        ~model1_path:!ocm_model_1
-        ~model2_path:!ocm_model_2
-        ~n_threads:!ocm_threads
-        ~cuda_device:!cuda_device
-        ~patch_size:!ocm_patch_size
-        ~patch_overlap:!ocm_patch_overlap
-        ~batch_size:!ocm_batch_size
-        ~s2_bands_data ~s2_masks_data in
-      save_masks (Filename.concat out_dir "mask_optimized.npy") mask_opt;
-      let t_ocm_end = Unix.gettimeofday () in
-      Printf.printf "  Saved mask_optimized.npy (%.1fs)\n%!" (t_ocm_end -. t_ocm_start)
+      let mask_opt = run_ocm ~model1_path:!ocm_model_1 ~model2_path:!ocm_model_2
+          ~n_threads:!ocm_threads ~cuda_device:!cuda_device ~patch_size:!ocm_patch_size
+          ~patch_overlap:!ocm_patch_overlap ~batch_size:!ocm_batch_size ~h ~w s2_bands s2_masks in
+      save_frames (Filename.concat s2_dir "mask_optimized.npy") Npy.Uint8 [| h; w |] bytes_of_u8 mask_opt;
+      printf "  Saved mask_optimized.npy (%.1fs)\n%!" (Unix.gettimeofday () -. t_ocm_start)
     end else
-      Printf.printf "\nSkipping OCM: no S2 timesteps\n%!"
+      printf "\nSkipping OCM: no S2 timesteps\n%!"
   end else
-    Printf.printf "\nSkipping OCM: no --ocm_model_1/--ocm_model_2 given\n%!";
+    printf "\nSkipping OCM: no --ocm_model_1/--ocm_model_2 given\n%!";
 
-  let t_end = Unix.gettimeofday () in
-  Printf.printf "\nDone: %s (%.1fs)\n%!" grid_id (t_end -. t_start)
+  printf "\nDone: %s (%.1fs)\n%!" grid_id (Unix.gettimeofday () -. t_start)
+  end in
+  (* Exit codes follow dpixel.py's policy: 2 = permanent (mark the cell bad),
+     3 = transient (re-queue). Over a shard's sub-windows a permanent failure
+     is normal (open sea has no Sentinel-2 items): that sub-window is skipped,
+     the uploader leaves it +inf, and only a transient failure fails the run. *)
+  let multi = List.length jobs > 1 in
+  let worst = List.fold_left (fun worst (grid_id, roi) ->
+    try run_job grid_id roi; worst with
+    | All_scenes_dropped msg ->
+      eprintf "PERMANENT FAILURE: %s\n%!" msg;
+      if multi then begin printf "  skipping %s\n%!" grid_id; worst end else 2
+    | Read_starved msg ->
+      eprintf "TRANSIENT FAILURE: %s\n%!" msg; max worst 3) 0 jobs in
+  exit worst

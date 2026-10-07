@@ -1,11 +1,21 @@
 (executable
  (name tessera_pipeline)
+ (modules tessera_pipeline)
  (public_name tessera-pipeline)
  (package tessera-pipeline)
  (libraries stac_client gdal onnxruntime yojson unix bigarray))
 
 (executable
  (name tessera_dpixel)
+ (modules tessera_dpixel)
  (public_name tessera-dpixel)
  (package tessera-dpixel)
- (libraries stac_client gdal npy onnxruntime yojson unix bigarray cmdliner))
+ (libraries tessera_common stac_client gdal npy onnxruntime yojson unix bigarray cmdliner))
+
+
+(executable
+ (name tessera_zarr_upload)
+ (modules tessera_zarr_upload)
+ (public_name tessera-zarr-upload)
+ (package tessera-zarr-upload)
+ (libraries tessera_common gdal npy zarr zarr-blosc zarr-s3 s3 eio eio_main yojson unix bigarray))

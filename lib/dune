@@ -1,0 +1,4 @@
+; Geometry shared by tessera-dpixel and tessera-zarr-upload.
+(library
+ (name tessera_common)
+ (libraries gdal))

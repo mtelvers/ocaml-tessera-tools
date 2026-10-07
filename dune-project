@@ -33,3 +33,20 @@
   onnxruntime
   yojson
   (cmdliner (>= 2.0))))
+
+(package
+ (name tessera-zarr-upload)
+ (synopsis "Place Tessera encoder output into an S3 Zarr store")
+ (description "Assembles Zarr v3 shards from .npy embedding tiles or windows and uploads them to the geotessera store layout on S3")
+ (depends
+  (ocaml (>= 5.1))
+  (dune (>= 3.0))
+  gdal
+  npy
+  zarr
+  zarr-blosc
+  zarr-s3
+  s3
+  (eio (>= 1.0))
+  eio_main
+  yojson))
