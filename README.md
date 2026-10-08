@@ -77,6 +77,14 @@ day10 exec . -- dune exec -- tessera-dpixel \
 Output layout (same as `dpixel.save`): `<output>/<grid_id>/s2/{bands,masks,doys}.npy`
 and `<output>/<grid_id>/s1/sar_{ascending,descending}{,_doy}.npy`.
 
+**Container.** `docker build -t tessera-dpixel .` builds only this tool (the
+`Dockerfile` installs the OCaml bindings from the tunbury opam overlay, the
+same commits day10 uses; `.dockerignore` keeps the data in the working tree
+out of the build context). Run it as
+`docker run --rm -v /data:/out tessera-dpixel --grid_id grid_51.05_10.35 --output /out --start 2024-01-01 --end 2024-12-31`;
+pass `-e DOWNLOAD_WORKERS=…` or the flags as usual. Output is written as root.
+The image's GDAL 3.10 / PROJ 9.6 produce byte-identical tiles too.
+
 **Grid-aligned windows.** Instead of a 0.1° tile the tool can build a window
 cut straight out of a seeded Zarr zone grid, the `zarr_poc/dpixel_window.py`
 mode: `--window ZONE:ROW:COL:HxW` (zone-grid pixel row/col of the top-left

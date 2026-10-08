@@ -1,0 +1,7 @@
+# The working tree holds many GB of data; send only what the Dockerfile copies.
+*
+!Dockerfile
+!dune-project
+!dune-workspace
+!lib/
+!bin/tessera_dpixel.ml

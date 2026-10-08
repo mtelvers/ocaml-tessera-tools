@@ -1,4 +1,6 @@
 # syntax=docker/dockerfile:1
+# tessera-dpixel: download tool only. tessera-pipeline (ONNX) and
+# tessera-zarr-upload (zarr, s3) are not built here.
 FROM ocaml/opam:debian-13-ocaml-5.3 AS build
 RUN sudo ln -sf /usr/bin/opam-2.5 /usr/bin/opam && opam init --reinit -ni
 RUN sudo rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/keep-cache
@@ -10,24 +12,24 @@ RUN sudo apt update && sudo apt-get --no-install-recommends install -y \
     pkg-config \
     m4 \
     curl
-# Install ONNX Runtime (used by dpixel for OmniCloudMask inference)
-RUN curl -L https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz | \
-    sudo tar xz -C /usr/local --strip-components=1
-RUN sudo ldconfig
-# Pin external dependencies
-RUN opam pin add stac_client https://github.com/mtelvers/stac-client.git -n && \
-    opam pin add gdal https://github.com/mtelvers/ocaml-gdal.git -n && \
-    opam pin add onnxruntime https://github.com/mtelvers/ocaml-onnxruntime.git -n && \
-    opam pin add npy https://github.com/mtelvers/ocaml-npy.git -n && \
-    opam install -y stac_client gdal onnxruntime npy yojson
+# The OCaml bindings (gdal, stac_client, npy) and conf-gdal come from the
+# tunbury overlay, pinned there by commit; it is the repository day10 builds
+# against too, so the image and the local build see the same versions.
+RUN opam repo add tunbury https://github.com/tunbury/opam-repository-overlay.git && \
+    opam update && \
+    opam install -y stac_client gdal npy yojson cmdliner
 WORKDIR /src
 COPY --chown=opam --link dune-project dune-workspace ./
-COPY --chown=opam --link bin/dpixel.ml bin/
-RUN echo '(executable (name dpixel) (libraries stac_client gdal npy onnxruntime yojson unix bigarray))' > bin/dune
-RUN opam exec -- dune build bin/dpixel.exe
+COPY --chown=opam --link lib/ lib/
+COPY --chown=opam --link bin/tessera_dpixel.ml bin/
+# Only the dpixel stanza: the repo's bin/dune also declares the pipeline and
+# the Zarr uploader, whose dependencies this image does not install.
+RUN echo '(executable (name tessera_dpixel) (modules tessera_dpixel) (libraries tessera_common stac_client gdal npy yojson unix bigarray cmdliner))' > bin/dune
+RUN opam exec -- dune build bin/tessera_dpixel.exe
 
 FROM debian:13
 RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+# libgdal is dlopen'ed by name, hence the unversioned symlink.
 RUN apt update && apt-get --no-install-recommends install -y \
     ca-certificates \
     curl \
@@ -35,8 +37,5 @@ RUN apt update && apt-get --no-install-recommends install -y \
     libcurl4 \
     libffi8 && \
     ln -s /usr/lib/x86_64-linux-gnu/libgdal.so.36 /usr/lib/x86_64-linux-gnu/libgdal.so
-# Install ONNX Runtime in runtime image
-RUN curl -L https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz | \
-    tar xz -C /usr/local --strip-components=1 && ldconfig
-COPY --from=build --link /src/_build/default/bin/dpixel.exe /usr/local/bin/dpixel
-ENTRYPOINT ["/usr/local/bin/dpixel"]
+COPY --from=build --link /src/_build/default/bin/tessera_dpixel.exe /usr/local/bin/tessera-dpixel
+ENTRYPOINT ["/usr/local/bin/tessera-dpixel"]
