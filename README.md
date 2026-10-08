@@ -6,19 +6,20 @@ and writing the encoder's output into the Zarr store on S3. The encoder
 itself is a separate program; these tools surround it.
 
 ```
- World Bank boundaries ──► tessera-shard ──► list of shards + live sub-windows
-                                                     │
-                                       tessera-dpixel --shard ZONE:SR:SC --windows …
-                                                     │
-                                   utmZZ/r<ROW>c<COL>/{s2,s1}/*.npy   (one per sub-window)
-                                                     │
-                                            tessera_encode  (C++, external)
-                                                     │
-                                   r<ROW>c<COL>.npy + r<ROW>c<COL>_scales.npy
-                                                     │
-                                       tessera-zarr-upload --zone --sr --sc --year
-                                                     │
-                      s3://bucket/prefix/utmZZ/{embeddings,embeddings_d16,embeddings_d4,scales}/c/…
+World Bank boundaries + zone_grids.json
+        |
+        v
+  tessera-shard            list of shards, each with its live sub-windows
+        |                  ZONE:SR:SC  i,j,k
+        v
+  tessera-dpixel           one d-pixel directory per sub-window
+        |                  utmZZ/r<ROW>c<COL>/{s2,s1}/*.npy
+        v
+  tessera_encode (C++)     one embedding pair per sub-window
+        |                  r<ROW>c<COL>.npy, r<ROW>c<COL>_scales.npy
+        v
+  tessera-zarr-upload      one object per array per shard
+                           utmZZ/{embeddings,…,scales}/c/<t>/…/<sr>/<sc>
 ```
 
 The unit of work is a **shard**: a 4096 × 4096 pixel (41 km) square of a UTM
@@ -42,19 +43,77 @@ there by commit):
 
 ```bash
 day10 build .
-# binaries in _build/default/bin/: tessera_shard.exe tessera_dpixel.exe tessera_zarr_upload.exe
+# _build/default/bin/: tessera_{shard,dpixel,zarr_upload}.exe
 ```
 
 `.day10` must list the overlay repository **before** the main opam
 repository: upstream has an unrelated package also called `zarr`.
 
-There is also a `Dockerfile` for `tessera-dpixel` alone (Debian 13, 547 MB):
+### Container image
+
+The `Dockerfile` builds all three tools into one image (Debian 13, GDAL
+3.10, 576 MB), installing the OCaml bindings from the overlay so it tracks
+the same commits as day10:
 
 ```bash
-docker build -t tessera-dpixel .
-docker run --rm -v /data:/out tessera-dpixel --grid_id grid_51.05_10.35 \
-  --output /out --start 2024-01-01 --end 2024-12-31
+docker build -t tessera-tools .
+docker run --rm -v ~/world_bank:/wb:ro -v $PWD:/work tessera-tools \
+  tessera-shard --shapefile /wb/WB_GAD_ADM0_complete.shp \
+  --country "United Kingdom" --zone_grid /work/zone_grids.json
 ```
+
+There is no entrypoint: name the tool. Docker runs as root, so files written
+to a bind mount are root-owned; Apptainer below does not have that problem.
+Tiles produced in the image are byte-identical to the host build.
+
+### Apptainer
+
+On HPC hosts (Dawn, CSD3) the image runs under Apptainer. Build the SIF once
+from the Docker image on a machine that has Docker:
+
+```bash
+apptainer build tessera-tools.sif docker-daemon://tessera-tools:latest  # 275 MB
+```
+
+or, without Docker on the target, push the image to a registry and pull:
+
+```bash
+docker tag tessera-tools ghcr.io/mtelvers/tessera-tools:latest
+docker push ghcr.io/mtelvers/tessera-tools:latest
+apptainer pull tessera-tools.sif docker://ghcr.io/mtelvers/tessera-tools:latest
+```
+
+Then each step is `apptainer exec` with the tool name. Apptainer runs as the
+invoking user, binds `$HOME`, `/tmp` and the current directory by default,
+and has network access, so outputs land with your ownership and only paths
+outside those need `--bind`:
+
+```bash
+# 1. the work list
+apptainer exec --bind /rds/world_bank:/wb:ro tessera-tools.sif \
+  tessera-shard --shapefile /wb/WB_GAD_ADM0_complete.shp \
+  --country "United Kingdom" --zone_grid zone_grids.json --output uk.shards
+
+# 2. download one shard's live sub-windows (one line of uk.shards)
+apptainer exec --env DOWNLOAD_WORKERS=4 --bind /scratch tessera-tools.sif \
+  tessera-dpixel --shard 30:27:13 --windows 0,4 --zone_grid zone_grids.json \
+  --output /scratch/dpixel --start 2017-01-01 --end 2017-12-31
+
+# 3. encode (tessera_encode, outside this image)
+
+# 4. upload the shard
+apptainer exec --env AWS_ACCESS_KEY_ID=… --env AWS_SECRET_ACCESS_KEY=… \
+  --bind /scratch tessera-tools.sif \
+  tessera-zarr-upload --endpoint https://s3.example --bucket tessera-v2 \
+  --prefix zarr/v2-world --zone 30 --sr 27 --sc 13 --year 2017 \
+  /scratch/emb/r110592c53248 /scratch/emb/r111616c53248
+```
+
+Environment variables pass with `--env NAME=value` (or by exporting
+`APPTAINERENV_NAME` on the host); with `--containall` or `--cleanenv` nothing
+else leaks in, which is the safer setting for credentials. `GDAL_NUM_THREADS`
+and the `S2_MIN_LOAD_FRAC`/`S1_MIN_LOAD_FRAC` knobs pass the same way. A
+Slurm array over the lines of `uk.shards` is the natural way to run it.
 
 ## 1. Decide the work: `tessera-shard`
 
@@ -83,8 +142,8 @@ Output, one shard per line, sorted by zone, row, column:
 ```
 
 Sub-window indices are row-major within the shard, 0 to 15 for 1024-px
-sub-windows (index = row × 4 + column), the encoding genesis's `/work`
-document and `tessera-dpixel --windows` use.
+sub-windows (index = row × 4 + column), as `tessera-dpixel --windows`
+takes them.
 
 Rules, inherited from genesis's `Roi` module: rings are clipped to the zone's
 6° band (with a margin) and densified before projecting, so a straight
@@ -103,7 +162,7 @@ What to expect:
 |---|---|---|---|
 | Isle of Man | 4 | 16 of 64 | 3 s |
 | United Kingdom | 259 | 2,941 of 4,144 | 8 s |
-| whole world (`--all`) | 93,204 | 1,318,114 of 1,491,264 (12 % skipped) | 2 min, 1.6 GB RAM |
+| world (`--all`) | 93,204 | 1,318,114 of 1,491,264 (12 % skipped) | 2 min, 1.6 GB |
 
 On the beta1 grids these are identical to genesis's own enumeration. The
 world list is about 3 MB of text.
@@ -127,13 +186,13 @@ output is the "d-pixel", the per-pixel time series the encoder consumes:
 ```
 /scratch/
 └── utm30/
-    ├── r110592c53248/              sub-window 0 of shard 27/13 (row 110592, col 53248)
+    ├── r110592c53248/              sub-window 0 of shard 27/13
     │   ├── s2/
-    │   │   ├── bands.npy           (T, 1024, 1024, 10) uint16   B04 B02 B03 B08 B8A B05 B06 B07 B11 B12
-    │   │   ├── masks.npy           (T, 1024, 1024)     uint8    1 = valid observation
-    │   │   └── doys.npy            (T,)                uint16   day of year per S2 date
+    │   │   ├── bands.npy     (T, 1024, 1024, 10) uint16  10 S2 bands
+    │   │   ├── masks.npy     (T, 1024, 1024)     uint8   1 = valid
+    │   │   └── doys.npy      (T,)                uint16  day of year
     │   └── s1/
-    │       ├── sar_ascending.npy       (Ta, 1024, 1024, 2) int16   VV, VH as (20·log10 + 50)·200
+    │       ├── sar_ascending.npy       (Ta, 1024, 1024, 2) int16  VV, VH
     │       ├── sar_ascending_doy.npy   (Ta,)               int16
     │       ├── sar_descending.npy      (Td, 1024, 1024, 2) int16
     │       └── sar_descending_doy.npy  (Td,)               int16
@@ -146,7 +205,7 @@ cloud-filtered S2 dates, 119 ascending and 118 descending S1 passes):
 
 | file | size |
 |---|---|
-| `s2/bands.npy` | 1.07 GB (20 MB per S2 date) |
+| `s2/bands.npy` (B04 B02 B03 B08 B8A B05 B06 B07 B11 B12) | 1.07 GB (20 MB per S2 date) |
 | `s2/masks.npy` | 53 MB |
 | `s1/sar_ascending.npy` + `sar_descending.npy` | 0.5 GB each (4 MB per pass) |
 | **total per sub-window-year** | **≈ 2.1 GB** |
@@ -196,8 +255,8 @@ It writes, named after the input directory:
 
 ```
 /embeddings/
-├── r110592c53248.npy          (1024, 1024, 128) int8    quantised embedding codes
-└── r110592c53248_scales.npy   (1024, 1024)      float32 per-pixel dequantisation scale
+├── r110592c53248.npy          (1024, 1024, 128) int8     embedding codes
+└── r110592c53248_scales.npy   (1024, 1024)      float32  per-pixel scale
 ```
 
 128 MiB plus 4 MiB per full sub-window, whatever the number of dates. The
@@ -212,8 +271,9 @@ When a shard's sub-windows are all encoded, one call writes the shard:
 
 ```bash
 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
-tessera-zarr-upload --endpoint https://s3.example --bucket tessera-v2 --prefix zarr/v2-world \
-  --zone 30 --sr 27 --sc 13 --year 2017 /embeddings/r110592c53248 /embeddings/r111616c53248
+tessera-zarr-upload --endpoint https://s3.example --bucket tessera-v2 \
+  --prefix zarr/v2-world --zone 30 --sr 27 --sc 13 --year 2017 \
+  /embeddings/r110592c53248 /embeddings/r111616c53248
 ```
 
 Each argument is one input: a `.npy` file (its `_scales` partner beside it)
@@ -228,11 +288,11 @@ writes four objects in this order:
 s3://tessera-v2/zarr/v2-world/
 ├── zarr.json                                  root group
 └── utm30/
-    ├── zarr.json                              zone group: spatial:transform (origin), proj:code
-    ├── embeddings_d4/c/0/0/27/13              int8  (1, 4,   4096, 4096)   first 4 bands
-    ├── embeddings_d16/c/0/0/27/13             int8  (1, 16,  4096, 4096)   first 16 bands
-    ├── scales/c/0/27/13                       f32   (1, 4096, 4096)
-    └── embeddings/c/0/0/27/13                 int8  (1, 128, 4096, 4096)   written LAST
+    ├── zarr.json                    zone group: spatial:transform, proj:code
+    ├── embeddings_d4/c/0/0/27/13    int8 (1, 4,   4096, 4096)  first 4 bands
+    ├── embeddings_d16/c/0/0/27/13   int8 (1, 16,  4096, 4096)  first 16 bands
+    ├── scales/c/0/27/13             f32  (1, 4096, 4096)
+    └── embeddings/c/0/0/27/13       int8 (1, 128, 4096, 4096)  written LAST
 ```
 
 The key is `array/c/<time index>/[band chunk]/<sr>/<sc>`; the time index is

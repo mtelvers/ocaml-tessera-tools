@@ -4,4 +4,7 @@
 !dune-project
 !dune-workspace
 !lib/
+!bin/dune
 !bin/tessera_dpixel.ml
+!bin/tessera_shard.ml
+!bin/tessera_zarr_upload.ml
