@@ -107,6 +107,9 @@ can be handed to `tessera-zarr-upload --sr SR --sc SC` in one go to write one ob
 per array. Already-produced sub-windows are skipped, so a run resumes. A sub-window
 with no Sentinel-2 items at all (open sea) is skipped with a message and left for
 the uploader to fill with `+inf`; only a transient failure makes the run exit 3.
+`--windows 0,5,15` restricts a shard to the listed sub-windows, numbered
+row-major 0..15 exactly as genesis's `/work` document lists the live ones
+(coverage is decided at sub-window level, since a coastal shard is mostly sea).
 A whole 4096-px shard as one `--window` also works, but a year of it needs tens of GB
 of RAM (one month measured at 9.4 GB peak, 3.1 GB output).
 
@@ -118,6 +121,7 @@ of RAM (one month measured at 9.4 GB peak, 3.1 GB output).
 | `--window` | one of these | Zone-grid window `ZONE:ROW:COL:HxW`; needs `--zone_grid` |
 | `--shard` | one of these | Zarr shard `ZONE:SR:SC`, run as `--subwindow` sub-windows; needs `--zone_grid` |
 | `--shard_px`, `--subwindow` | `4096`, `1024` | Shard side and sub-window side in pixels |
+| `--windows` | all | With `--shard`: comma-separated sub-window indices, row-major, as in genesis `/work` |
 | `--zone_grid` | | Zone grid JSON (`zone_grids.json` dump or genesis `/work` document) |
 | `--output` | (required) | Output directory |
 | `--start` | `2024-01-01` | Start date (YYYY-MM-DD) |

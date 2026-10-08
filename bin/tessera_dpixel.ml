@@ -1056,6 +1056,7 @@ let () =
   let shard_arg = ref "" in
   let shard_px = ref 4096 in
   let subwindow = ref 1024 in
+  let windows_arg = ref "" in
   let zone_grid_arg = ref "" in
   let output_dir = ref "" in
   let start_date = ref "2024-01-01" in
@@ -1080,6 +1081,7 @@ let () =
     ("--shard", Arg.Set_string shard_arg, "Zarr shard ZONE:SR:SC: run every --subwindow sub-window of it in turn (needs --zone_grid)");
     ("--shard_px", Arg.Set_int shard_px, "Shard side in pixels (default 4096)");
     ("--subwindow", Arg.Set_int subwindow, "Sub-window side for --shard; must divide --shard_px (default 1024)");
+    ("--windows", Arg.Set_string windows_arg, "With --shard: only these sub-windows, comma-separated indices row-major (0..n*n-1), genesis's /work \"windows\" list");
     ("--zone_grid", Arg.Set_string zone_grid_arg, "Zone grid JSON: a zone_grids.json dump or a genesis /work document");
     ("--output", Arg.Set_string output_dir, "Output directory for dpixel .npy files");
     ("--start", Arg.Set_string start_date, "Start date (YYYY-MM-DD)");
@@ -1148,15 +1150,24 @@ let () =
         let zone = int_of_string z and sr = int_of_string r and sc = int_of_string c in
         let g = zone_grid_of_file !zone_grid_arg zone in
         let n = !subwindow and sp = !shard_px in
+        let per_side = sp / n in
+        (* Sub-window index = row-major position in the shard, as genesis and
+           the PoC number them, independent of clipping at the grid edge. *)
+        let wanted = match !windows_arg with
+          | "" -> None
+          | l -> Some (List.map (fun x -> int_of_string (String.trim x)) (String.split_on_char ',' l)) in
         let subs = List.concat_map (fun dr ->
           List.filter_map (fun dc ->
+            let idx = dr * per_side + dc in
             let row = sr * sp + dr * n and col = sc * sp + dc * n in
             let h = min n (g.zg_height_px - row) and w = min n (g.zg_width_px - col) in
             if h <= 0 || w <= 0 then None
+            else if (match wanted with Some l -> not (List.mem idx l) | None -> false) then None
             else Some (window_id zone row col, roi_of_window g ~row ~col ~h ~w))
-            (List.init (sp / n) Fun.id)) (List.init (sp / n) Fun.id) in
-        if subs = [] then failwith (Printf.sprintf "shard %s lies outside the zone %02d grid" !shard_arg zone);
-        printf "shard %s: %d sub-windows of %dx%d\n%!" !shard_arg (List.length subs) n n;
+            (List.init per_side Fun.id)) (List.init per_side Fun.id) in
+        if subs = [] then failwith (Printf.sprintf "shard %s: no sub-windows selected inside the zone %02d grid" !shard_arg zone);
+        printf "shard %s: %d sub-windows of %dx%d%s\n%!" !shard_arg (List.length subs) n n
+          (match wanted with Some _ -> " (selected by --windows)" | None -> "");
         subs
       | _ -> failwith (Printf.sprintf "%s is not of the form ZONE:SR:SC" !shard_arg)
     end in
