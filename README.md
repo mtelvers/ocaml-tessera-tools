@@ -1,8 +1,8 @@
-# ocaml-tessera-tools
+# Tessera Tools
 
 Command-line tools, in OCaml, for producing the Tessera v2 embedding store:
 deciding what to produce, downloading the satellite time series for it,
-and writing the encoder's output into the Zarr store on S3. The encoder
+*dpixel*, and writing the encoder's output into the Zarr store on S3. The encoder
 itself is a separate program; these tools surround it.
 
 ```
@@ -36,18 +36,42 @@ options follow at the end.
 
 ## Build
 
-The tools build with [day10](https://github.com/tunbury/day10), which
-assembles the dependency layers from the tunbury opam overlay (the OCaml
-bindings `gdal`, `stac_client`, `npy`, `zarr`, `zarr-s3` and `s3` are pinned
-there by commit):
+### opam
+
+The OCaml bindings (`gdal`, `stac_client`, `npy`, `zarr`, `zarr-blosc`,
+`zarr-s3`, `s3`, `tessera-grid`) and `conf-gdal` come from the
+[tunbury opam overlay](https://github.com/tunbury/opam-repository-overlay),
+pinned there by commit. Add it with higher priority than the default
+repository (upstream has an unrelated package also called `zarr`), then
+install the dependencies and build. On Debian or Ubuntu:
 
 ```bash
-day10 build .
+sudo apt-get install -y libgdal-dev libblosc-dev libcurl4-openssl-dev \
+  libffi-dev libgmp-dev pkg-config m4
+opam repo add --rank 1 tunbury \
+  https://github.com/tunbury/opam-repository-overlay.git
+opam update
+opam install -y stac_client gdal npy yojson cmdliner \
+  zarr zarr-blosc zarr-s3 s3 eio eio_main tessera-grid
+dune build
 # _build/default/bin/: tessera_{shard,dpixel,zarr_upload}.exe
 ```
 
-`.day10` must list the overlay repository **before** the main opam
-repository: upstream has an unrelated package also called `zarr`.
+OCaml 5.1 or later. GDAL 3.8 to 3.11 have all been checked for byte-identical
+output; `dune-workspace` relaxes the C flags the GDAL ctypes bindings need.
+The `Dockerfile` is the same recipe, verbatim.
+
+### day10
+
+[day10](https://github.com/tunbury/day10) assembles the same dependency
+layers in a container, so no switch is needed on the host:
+
+```bash
+day10 build .
+```
+
+`.day10` must list the overlay repository before the main opam repository,
+for the same `zarr` reason.
 
 ### Container image
 
@@ -68,19 +92,20 @@ Tiles produced in the image are byte-identical to the host build.
 
 ### Apptainer
 
-On HPC hosts (Dawn, CSD3) the image runs under Apptainer. Build the SIF once
+On the HPCs (Dawn, Endeavour) the image runs under Apptainer. Build the SIF once
 from the Docker image on a machine that has Docker:
 
 ```bash
 apptainer build tessera-tools.sif docker-daemon://tessera-tools:latest  # 275 MB
 ```
 
-or, without Docker on the target, push the image to a registry and pull:
+or, without Docker on the target, push the image to a registry you can
+write to and pull it there, for example:
 
 ```bash
-docker tag tessera-tools ghcr.io/mtelvers/tessera-tools:latest
-docker push ghcr.io/mtelvers/tessera-tools:latest
-apptainer pull tessera-tools.sif docker://ghcr.io/mtelvers/tessera-tools:latest
+docker tag tessera-tools ghcr.io/<you>/tessera-tools:latest
+docker push ghcr.io/<you>/tessera-tools:latest   # after docker login ghcr.io
+apptainer pull tessera-tools.sif docker://ghcr.io/<you>/tessera-tools:latest
 ```
 
 Then each step is `apptainer exec` with the tool name. Apptainer runs as the
@@ -236,16 +261,15 @@ Behaviour worth knowing:
   freshly signed URLs, waiting past the current SAS expiry if it is about to
   roll over.
 - Concurrency: `--download_workers` (or `$DOWNLOAD_WORKERS`, default 4) is
-  the number of simultaneous COG reads per process, the same lever as dask
-  `num_workers` in the Python worker; the fleet notes keep it at 4 so many
-  processes together do not trip MPC throttling. GDAL reads its own
-  configuration from the environment (`GDAL_NUM_THREADS`, `GDAL_CACHEMAX`,
-  …); CPU threads per process are about `download_workers × GDAL_NUM_THREADS`.
+  the number of simultaneous COG reads per process. Keep it modest when many
+  processes run at once: it is their total that trips Planetary Computer's
+  rate limiting. GDAL reads its own configuration from the environment
+  (`GDAL_NUM_THREADS`, `GDAL_CACHEMAX`, …); CPU threads per process are
+  about `download_workers × GDAL_NUM_THREADS`.
 - The 0.1° tile path, `--grid_id grid_<lon>_<lat>`, is also supported. It
-  reproduces the worker pipeline's `dpixel.py` byte for byte (verified by
-  checksum on whole tiles against `/data/aardvark`) and exists for
-  reproducing and ingesting the existing tile archive; new production goes
-  through shards. A whole shard as one `--window 30:110592:53248:4096x4096`
+  reproduces the reference Python implementation byte for byte and exists
+  for reproducing and ingesting the existing tile archive; new production
+  goes through shards. A whole shard as one `--window 30:110592:53248:4096x4096`
   works too but needs tens of GB of RAM per year.
 
 ## 3. Encode: `tessera_encode` (external)
@@ -347,15 +371,16 @@ From the `--all` enumeration: 93,204 shards, 1.32 million live sub-windows.
 | embeddings `.npy` | 132 MiB | ≈ 180 TB transient, deleted after upload |
 | Zarr store | | ≤ 110 TB, four objects per shard |
 
-Download dominates: at a few minutes per sub-window-year and MPC's rate
-limits the binding constraint is fleet-wide concurrency, not CPU.
+Download dominates: at a few minutes per sub-window-year and Planetary
+Computer's rate limits, the binding constraint is the total concurrency
+across all workers, not CPU.
 
 ## Verifying
 
 - dpixel: both the `--grid_id` and the `--window` paths are byte-identical
-  to the Python worker pipeline they port (sha256 of all seven files on whole
-  2017 tiles and windows, including a tile straddling two UTM zones, with
-  GDAL 3.8, 3.10 and 3.11). See `warp_read` in `bin/tessera_dpixel.ml` for
+  to the reference Python implementation (`dpixel.py`) they port: sha256 of
+  all seven files on whole 2017 tiles and windows, including a tile
+  straddling two UTM zones, with GDAL 3.8, 3.10 and 3.11. See `warp_read` in `bin/tessera_dpixel.ml` for
   how rasterio's WarpedVRT read is reproduced.
 - uploader: against a MinIO store seeded from the published beta1 metadata,
   zarr-python reads back embeddings, depth prefixes and scales identical to
@@ -424,5 +449,5 @@ is later placed at. Shard and window addressing never goes through it.
 ## Data sources
 
 Sentinel-2 L2A and Sentinel-1 RTC from Microsoft Planetary Computer
-(`planetarycomputer.microsoft.com`), the same source as the Python worker
-pipeline, so the output is byte-identical to it.
+(`planetarycomputer.microsoft.com`), the source the published store was
+built from.
