@@ -5,15 +5,14 @@ description: "Tessera dpixel tool in OCaml"
 maintainer: ["Mark Elvers <mark.elvers@tunbury.org>"]
 authors: ["Mark Elvers <mark.elvers@tunbury.org>"]
 license: "MIT"
-homepage: "https://github.com/mtelvers/ocaml-tessera"
-bug-reports: "https://github.com/mtelvers/ocaml-tessera/issues"
+homepage: "https://github.com/mtelvers/ocaml-tessera-tools"
+bug-reports: "https://github.com/mtelvers/ocaml-tessera-tools/issues"
 depends: [
   "ocaml" {>= "4.14"}
   "dune" {>= "3.0" & >= "3.0"}
   "stac_client"
   "gdal"
   "npy"
-  "onnxruntime"
   "yojson"
   "cmdliner" {>= "2.0"}
   "odoc" {with-doc}
@@ -32,4 +31,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "git+https://github.com/mtelvers/ocaml-tessera.git"
+dev-repo: "git+https://github.com/mtelvers/ocaml-tessera-tools.git"

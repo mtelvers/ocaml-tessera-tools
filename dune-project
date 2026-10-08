@@ -3,7 +3,7 @@
 
 (generate_opam_files true)
 
-(source (github mtelvers/ocaml-tessera))
+(source (github mtelvers/ocaml-tessera-tools))
 (license MIT)
 (authors "Mark Elvers <mark.elvers@tunbury.org>")
 (maintainers "Mark Elvers <mark.elvers@tunbury.org>")
