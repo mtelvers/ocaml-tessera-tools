@@ -49,3 +49,14 @@
   (eio (>= 1.0))
   eio_main
   yojson))
+
+(package
+ (name tessera-shard)
+ (synopsis "Live Zarr shards and sub-windows of a region")
+ (description "tessera-tiles for the Zarr store: reads World Bank (or any OGR) region polygons and lists the shards and sub-windows of a seeded zone grid they cover")
+ (depends
+  (ocaml (>= 5.1))
+  (dune (>= 3.0))
+  tessera-grid
+  gdal
+  yojson))

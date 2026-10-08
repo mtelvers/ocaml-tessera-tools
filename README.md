@@ -161,6 +161,36 @@ scenes, emitted once per orbit present. Transient read failures are retried
 once with freshly signed URLs. See the comment on `warp_read` in
 `bin/tessera_dpixel.ml` for how rasterio's WarpedVRT read is reproduced.
 
+### tessera-shard — Which shards and sub-windows a region covers
+
+`tessera-tiles` for the Zarr store: reads region polygons from the World Bank
+GAD ADM0 shapefile (or a genesis `collections.shp`, or any OGR source) and
+lists, for a seeded zone grid, every shard the selected regions touch and the
+row-major indices of its live 1024-px sub-windows, in the encoding genesis's
+`/work` document and `tessera-dpixel --windows` use.
+
+```bash
+day10 exec . -- dune exec -- tessera-shard \
+  --shapefile ~/world_bank/WB_GAD_ADM0_complete.shp --country "United Kingdom" \
+  --zone_grid zarr_poc/zone_grids.json --output uk.shards
+# 30:27:13	0,4
+# 29:34:11	2,3,5,6,7,8,9,10,11,12,13,14,15
+```
+
+It is genesis's `Roi` module with the projection done by PROJ (through GDAL)
+instead of tessera-grid's series, and the same rules: rings clipped to the
+zone band with a margin and densified before projecting, a sub-window owned by
+the zone of its centre longitude, the request choosing the shards but all
+land choosing the windows (a shard is written whole), and land outside the
+seeded grid reported rather than folded in. `--list` prints the region names;
+`--all` takes every region. On the beta1 grids it reproduces genesis's own
+enumeration exactly (United Kingdom: 259 shards, 2,941 of 4,144 sub-windows;
+Isle of Man: 4 shards, 16 sub-windows), in 8 s for the UK.
+
+Each output line feeds one shard's production:
+`tessera-dpixel --shard 30:27:13 --windows 0,4 …`, inference, then
+`tessera-zarr-upload --zone 30 --sr 27 --sc 13 …`.
+
 ### tessera-zarr-upload — Encoder output into the S3 Zarr store
 
 Places encoder output into the shards of the geotessera-layout Zarr v3 store

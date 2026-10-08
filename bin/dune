@@ -19,3 +19,10 @@
  (public_name tessera-zarr-upload)
  (package tessera-zarr-upload)
  (libraries tessera_common gdal npy zarr zarr-blosc zarr-s3 s3 eio eio_main yojson unix bigarray))
+
+(executable
+ (name tessera_shard)
+ (modules tessera_shard)
+ (public_name tessera-shard)
+ (package tessera-shard)
+ (libraries tessera_common tessera-grid gdal yojson unix))
