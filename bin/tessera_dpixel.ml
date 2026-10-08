@@ -4,7 +4,7 @@
    writes the d-pixel .npy arrays consumed by the Tessera encoders.
 
    This is a port of dpixel.py (the worker pipeline's shared d-pixel core) and
-   is byte-identical to it on the default MPC path:
+   is byte-identical to it:
 
    - Tile geometry is derived from the grid id exactly as
      dpixel.load_roi_from_grid_id does (UTM zone from the centre longitude,
@@ -43,20 +43,6 @@ let scl_invalid = [| 0; 1; 2; 3; 8; 9 |]
 let harmonisation_date_ymd = (2022, 1, 25)
 let harmonisation_offset = 1000
 let stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
-
-type data_source = MPC | AWS
-
-let aws_stac_url = "https://earth-search.aws.element84.com/v1"
-
-(* AWS S2 band names, same order as s2_bands for MPC *)
-let s2_bands_aws = [| "red"; "blue"; "green"; "nir"; "nir08";
-                       "rededge1"; "rededge2"; "rededge3"; "swir16"; "swir22" |]
-
-let cmr_url = "https://cmr.earthdata.nasa.gov/search/granules.json"
-let opera_collection_id = "C2777436413-ASF"
-
-let s2_band_names = function MPC -> s2_bands | AWS -> s2_bands_aws
-let scl_asset_name = function MPC -> "SCL" | AWS -> "scl"
 
 (* SAS freshness knobs (dpixel._memoize_research) *)
 let sas_margin = 30.0
@@ -277,12 +263,8 @@ type failure_kind = Transient | Permanent
 
 exception Read_failure of failure_kind * string
 
-(** Convert a URL to a GDAL virtual filesystem path. *)
-let gdal_vsi_path url =
-  if String.length url > 5 && String.sub url 0 5 = "s3://" then
-    "/vsis3/" ^ String.sub url 5 (String.length url - 5)
-  else
-    "/vsicurl/" ^ url
+(** A signed HTTPS asset URL as a GDAL virtual filesystem path. *)
+let gdal_vsi_path url = "/vsicurl/" ^ url
 
 (** Warp [url] onto the ROI's snapped grid and return the top-left H x W
     window of band 1 as a bigarray of the requested kind.
@@ -518,7 +500,7 @@ type s2_date_result =
   | S2_retry of s_item list        (* items that failed transiently *)
   | S2_dropped                     (* all items failed permanently after retry *)
 
-let process_s2 ~(roi : roi) ~data_source ~n_workers ~research (items : s_item list) =
+let process_s2 ~(roi : roi) ~n_workers ~research (items : s_item list) =
   let h = roi.height and w = roi.width in
   let hw = h * w in
   let cov = new_coverage () in
@@ -531,7 +513,7 @@ let process_s2 ~(roi : roi) ~data_source ~n_workers ~research (items : s_item li
     printf "  Streaming %d S2 scenes across %d dates...\n%!" (List.length items) (List.length by_date);
 
     (* ---- Pass 1: SCL for every scene (parallel), retry transients once ---- *)
-    let scl_name = scl_asset_name data_source in
+    let scl_name = "SCL" in
     let load_scl (si : s_item) =
       match get_asset_href si.it scl_name with
       | None -> Error (Permanent, "no SCL asset")
@@ -590,8 +572,7 @@ let process_s2 ~(roi : roi) ~data_source ~n_workers ~research (items : s_item li
     printf "  %d/%d dates pass cloud filter\n%!" (List.length valid_dates) (List.length by_date);
 
     (* ---- Pass 2: spectral bands per valid date ---- *)
-    let band_names = s2_band_names data_source in
-    let harmonise = data_source = MPC in
+    let band_names = s2_bands in
     let load_date (date, (scl_items : s_item list), (tile_sel : i16)) =
       let n_tiles = List.length scl_items in
       let failed = ref [] in
@@ -611,7 +592,7 @@ let process_s2 ~(roi : roi) ~data_source ~n_workers ~research (items : s_item li
       else if List.exists Option.is_none tile_bands then S2_dropped
       else begin
         let tiles = Array.of_list (List.map Option.get tile_bands) in
-        let after = harmonise && is_after_harmonisation date in
+        let after = is_after_harmonisation date in
         let out : u16 = Array1.create int16_unsigned c_layout (hw * 10) in
         for bi = 0 to 9 do
           for p = 0 to hw - 1 do
@@ -713,20 +694,6 @@ let mosaic_mean ~hw (db_list : i16 list) : i16 option =
     end
   end
 
-(** Last-valid-wins mosaic (OPERA path, unchanged from the original tool). *)
-let mosaic_last ~hw (db_list : i16 list) : i16 option =
-  if db_list = [] then None
-  else begin
-    let out = Array1.create int16_signed c_layout hw in
-    Array1.fill out 0;
-    List.iter (fun db ->
-      for p = 0 to hw - 1 do
-        let v = Array1.unsafe_get db p in
-        if v > 0 then Array1.unsafe_set out p v
-      done) db_list;
-    Some out
-  end
-
 let interleave_vv_vh ~hw (vv : i16 option) (vh : i16 option) : i16 =
   let out = Array1.create int16_signed c_layout (hw * 2) in
   for p = 0 to hw - 1 do
@@ -741,9 +708,9 @@ type s1_date_result =
   | S1_unavailable                           (* no loadable scene (e.g. HH/HV) *)
   | S1_skipped                               (* loaded but nothing valid in ROI *)
 
-(** dpixel.process_s1 (MPC): per date, mosaic ALL of the date's scenes, then
+(** dpixel.process_s1: per date, mosaic ALL of the date's scenes, then
     emit that mosaic once per orbit present, in sorted orbit order. *)
-let process_s1_mpc ~(roi : roi) ~n_workers ~research (items : s_item list) =
+let process_s1 ~(roi : roi) ~n_workers ~research (items : s_item list) =
   let hw = roi.height * roi.width in
   let cov = new_coverage () in
   if items = [] then begin
@@ -818,148 +785,6 @@ let process_s1_mpc ~(roi : roi) ~n_workers ~research (items : s_item list) =
     (List.rev !asc, List.rev !asc_d, List.rev !desc, List.rev !desc_d, cov)
   end
 
-(* ======================== OPERA RTC-S1 (AWS) ======================== *)
-
-type s1_tile = { st_vv : string option; st_vh : string option }
-type s1_group = { sg_date : string; sg_orbit : string; sg_tiles : s1_tile list }
-
-let read_edl_token () =
-  let token_path = Filename.concat (Sys.getenv "HOME") ".edl_bearer_token" in
-  let ic = open_in token_path in
-  let token = String.trim (input_line ic) in
-  close_in ic;
-  token
-
-let setup_opera_gdal_auth token =
-  let header_path = Filename.concat (Filename.get_temp_dir_name ()) "gdal_opera_headers.txt" in
-  let oc = open_out header_path in
-  Printf.fprintf oc "Authorization: Bearer %s\nCookie: asf-urs=%s\n" token token;
-  close_out oc;
-  Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" header_path;
-  eprintf "  GDAL OPERA auth configured\n%!"
-
-type opera_granule = { og_date : string; og_vv_url : string; og_vh_url : string }
-
-let search_cmr_opera ~(client : Stac_client.t) ~bbox:(xmin, ymin, xmax, ymax) ~datetime =
-  let temporal =
-    match String.split_on_char '/' datetime with
-    | [s; e] ->
-      let fix d = if String.length d = 10 then d ^ "T00:00:00Z" else d in
-      fix s ^ "," ^ fix e
-    | _ -> datetime ^ "," ^ datetime
-  in
-  let bbox_str = Printf.sprintf "%.6f,%.6f,%.6f,%.6f" xmin ymin xmax ymax in
-  let rec fetch_all page_num acc =
-    let url = Printf.sprintf
-      "%s?collection_concept_id=%s&bounding_box=%s&temporal=%s&page_size=2000&page_num=%d"
-      cmr_url opera_collection_id bbox_str temporal page_num in
-    let code, body = Stac_client.http_get client url in
-    if code <> 200 then failwith (Printf.sprintf "CMR search failed (%d): %s" code body);
-    let json = Yojson.Safe.from_string body in
-    let entries = match json with
-      | `Assoc fields ->
-        (match List.assoc_opt "feed" fields with
-         | Some (`Assoc feed_fields) ->
-           (match List.assoc_opt "entry" feed_fields with
-            | Some (`List entries) -> entries
-            | _ -> [])
-         | _ -> [])
-      | _ -> [] in
-    if entries = [] then List.rev acc
-    else begin
-      let granules = List.filter_map (fun entry ->
-        match entry with
-        | `Assoc fields ->
-          let time_start = match List.assoc_opt "time_start" fields with
-            | Some (`String s) -> date_of_datetime s | _ -> "" in
-          if time_start = "" then None
-          else begin
-            let title = match List.assoc_opt "title" fields with
-              | Some (`String s) -> s | _ -> "" in
-            if title = "" then begin
-              eprintf "  Warning: skipping CMR entry without title\n%!"; None
-            end else
-              let base = Printf.sprintf
-                "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/%s/%s" title title in
-              Some { og_date = time_start; og_vv_url = base ^ "_VV.tif"; og_vh_url = base ^ "_VH.tif" }
-          end
-        | _ -> None) entries in
-      let acc = List.rev_append granules acc in
-      if List.length entries < 2000 then List.rev acc else fetch_all (page_num + 1) acc
-    end
-  in
-  fetch_all 1 []
-
-let read_orbit_direction_from_cog url =
-  match Gdal.Dataset.open_ex (gdal_vsi_path url) with
-  | Error _ -> eprintf "  Warning: could not open COG for orbit metadata\n%!"; "unknown"
-  | Ok ds ->
-    let result = match Gdal.Dataset.get_metadata_item ds ~key:"ORBIT_PASS_DIRECTION" ~domain:"" with
-      | Some s -> String.lowercase_ascii s | None -> "unknown" in
-    Gdal.Dataset.close ds; result
-
-let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
-  eprintf "  Searching CMR for OPERA RTC-S1...\n%!";
-  let granules = search_cmr_opera ~client ~bbox ~datetime in
-  eprintf "  Found %d OPERA granules\n%!" (List.length granules);
-  if granules = [] then []
-  else begin
-    let by_date = Hashtbl.create 64 in
-    List.iter (fun g ->
-      let prev = try Hashtbl.find by_date g.og_date with Not_found -> [] in
-      Hashtbl.replace by_date g.og_date (g :: prev)) granules;
-    let sorted_dates = List.sort String.compare (Hashtbl.fold (fun k _ acc -> k :: acc) by_date []) in
-    let groups = ref [] in
-    List.iter (fun date_str ->
-      let day_granules = List.rev (Hashtbl.find by_date date_str) in
-      let by_orbit = Hashtbl.create 4 in
-      List.iter (fun g ->
-        let orbit = read_orbit_direction_from_cog g.og_vv_url in
-        let prev = try Hashtbl.find by_orbit orbit with Not_found -> [] in
-        Hashtbl.replace by_orbit orbit (g :: prev)) day_granules;
-      Hashtbl.iter (fun orbit orbit_granules ->
-        let tiles = List.map (fun g -> { st_vv = Some g.og_vv_url; st_vh = Some g.og_vh_url }) orbit_granules in
-        groups := { sg_date = date_str; sg_orbit = orbit; sg_tiles = tiles } :: !groups) by_orbit
-    ) sorted_dates;
-    List.rev !groups
-  end
-
-(** OPERA groups: one (date, orbit) per group, bilinear, last-valid-wins. *)
-let process_s1_opera ~(roi : roi) ~n_workers groups =
-  let hw = roi.height * roi.width in
-  if groups = [] then begin
-    printf "  No S1 data to process\n%!";
-    ([], [], [], [])
-  end else begin
-    printf "  Loading SAR data (%d groups)...\n%!" (List.length groups);
-    let results = parallel_map ~n_workers (fun group ->
-      let mosaic_pol get_url =
-        let db_list = List.filter_map (fun tile ->
-          match get_url tile with
-          | None -> None
-          | Some url ->
-            (try
-               let db = amplitude_to_db ~roi (flat2 (warp_read Gdal.BA_float32 ~roi ~resampling:"bilinear" url)) in
-               let has_any = ref false in
-               for p = 0 to hw - 1 do if Array1.unsafe_get db p > 0 then has_any := true done;
-               if !has_any then Some db else None
-             with Read_failure (_, m) ->
-               eprintf "  %s: skipped %s: %s\n%!" group.sg_date url m; None)
-        ) group.sg_tiles in
-        mosaic_last ~hw db_list in
-      let vv = mosaic_pol (fun t -> t.st_vv) and vh = mosaic_pol (fun t -> t.st_vh) in
-      if vv = None && vh = None then None
-      else Some (group.sg_orbit, doy_of_date_str group.sg_date, interleave_vv_vh ~hw vv vh)
-    ) (Array.of_list groups) in
-    let asc = ref [] and asc_d = ref [] and desc = ref [] and desc_d = ref [] in
-    Array.iter (function
-      | Some (orbit, doy, frame) ->
-        if orbit = "ascending" then begin asc := frame :: !asc; asc_d := doy :: !asc_d end
-        else begin desc := frame :: !desc; desc_d := doy :: !desc_d end
-      | None -> ()) results;
-    (List.rev !asc, List.rev !asc_d, List.rev !desc, List.rev !desc_d)
-  end
-
 (* ======================== Coverage policy ======================== *)
 
 exception All_scenes_dropped of string   (* permanent: mark cell bad *)
@@ -1020,7 +845,6 @@ let () =
   let start_date = ref "2024-01-01" in
   let end_date = ref "2024-12-31" in
   let max_cloud = ref 100.0 in
-  let data_source_str = ref "mpc" in
   (* Per-instance concurrency of COG reads: the same lever as dask
      num_workers / --download-workers / DOWNLOAD_WORKERS in the Python stack
      (build_tile.py uses 4; the fleet notes keep DL=4 per worker so many
@@ -1045,7 +869,6 @@ let () =
     ("--start", Arg.Set_string start_date, "Start date (YYYY-MM-DD)");
     ("--end", Arg.Set_string end_date, "End date (YYYY-MM-DD)");
     ("--max_cloud", Arg.Set_float max_cloud, "Max cloud cover % (default: 100)");
-    ("--data_source", Arg.Set_string data_source_str, "Data source: mpc or aws (default: mpc)");
     ("--download_workers", Arg.Set_int download_workers, "Concurrent COG reads (domains); default $DOWNLOAD_WORKERS or 4");
     ("--s2_min_load_frac", Arg.Set_float s2_min_load_frac, "Min fraction of S2 dates that must load, else exit 3; default $S2_MIN_LOAD_FRAC or 0.9 (0 disables)");
     ("--s1_min_load_frac", Arg.Set_float s1_min_load_frac, "Min fraction of S1 dates that must load, else exit 3; default $S1_MIN_LOAD_FRAC or 0.9 (0 disables)");
@@ -1055,10 +878,6 @@ let () =
   ] in
   Arg.parse speclist (fun _ -> ()) "Tessera dpixel download tool";
 
-  let data_source = match String.lowercase_ascii !data_source_str with
-    | "mpc" -> MPC
-    | "aws" -> AWS
-    | s -> failwith (Printf.sprintf "Unknown data source: %s (expected mpc or aws)" s) in
   let nested = match String.lowercase_ascii !layout with
     | "nested" -> true | "flat" -> false
     | s -> failwith (Printf.sprintf "Unknown layout: %s (expected nested or flat)" s) in
@@ -1144,16 +963,12 @@ let () =
     roi.height roi.width roi.h_out roi.w_out roi.dst_srs minx miny maxx maxy roi.resolution;
   let (xmin, ymin, xmax, ymax) = roi.bbox in
 
-  let sign items = match data_source with
-    | MPC -> with_retries ~label:"SAS signing" (fun () ->
-               List.map (Stac_client.sign_planetary_computer client) items)
-    | AWS -> items in
+  let sign items = with_retries ~label:"SAS signing" (fun () ->
+    List.map (Stac_client.sign_planetary_computer client) items) in
 
   (* Sentinel-2 *)
-  let s2_base_url = match data_source with MPC -> stac_url | AWS -> aws_stac_url in
   let t_s2_start = Unix.gettimeofday () in
-  printf "\nSearching Sentinel-2 [%s] (%s)...\n%!"
-    (match data_source with MPC -> "MPC" | AWS -> "AWS") date_range;
+  printf "\nSearching Sentinel-2 (%s)...\n%!" date_range;
   let s2_params : Stac_client.search_params = {
     collections = ["sentinel-2-l2a"];
     bbox = [xmin; ymin; xmax; ymax];
@@ -1162,45 +977,33 @@ let () =
     limit = None;
   } in
   let search_s2 () = sign (with_retries ~label:"S2 STAC search"
-                             (fun () -> Stac_client.search client ~base_url:s2_base_url s2_params)) in
+                             (fun () -> Stac_client.search client ~base_url:stac_url s2_params)) in
   let s2_items = search_s2 () in
   printf "  Found %d scenes\n%!" (List.length s2_items);
   printf "Processing Sentinel-2 (workers=%d)...\n%!" n_workers;
   let research_s2 = memoize_research (if !no_research then None else Some search_s2) in
   let (s2_bands, s2_masks, s2_doys, cov_s2) =
-    process_s2 ~roi ~data_source ~n_workers ~research:research_s2 (List.map s_item_of s2_items) in
+    process_s2 ~roi ~n_workers ~research:research_s2 (List.map s_item_of s2_items) in
   printf "  Result: %d valid days (%.1fs)\n%!" (List.length s2_bands) (Unix.gettimeofday () -. t_s2_start);
 
   (* Sentinel-1 *)
   let t_s1_start = Unix.gettimeofday () in
-  printf "\nSearching Sentinel-1 [%s] (%s)...\n%!"
-    (match data_source with MPC -> "MPC" | AWS -> "AWS/OPERA") date_range;
-  let (s1a, s1ad, s1de, s1dd, cov_s1) = match data_source with
-    | MPC ->
-      let s1_params : Stac_client.search_params = {
-        collections = ["sentinel-1-rtc"];
-        bbox = [xmin; ymin; xmax; ymax];
-        datetime = date_range;
-        query = None;
-        limit = None;
-      } in
-      let search_s1 () = sign (with_retries ~label:"S1 STAC search"
-                                 (fun () -> Stac_client.search client ~base_url:stac_url s1_params)) in
-      let s1_items = search_s1 () in
-      printf "  Found %d scenes\n%!" (List.length s1_items);
-      printf "Processing Sentinel-1 (workers=%d)...\n%!" n_workers;
-      let research_s1 = memoize_research (if !no_research then None else Some search_s1) in
-      process_s1_mpc ~roi ~n_workers ~research:research_s1 (List.map s_item_of s1_items)
-    | AWS ->
-      let token = read_edl_token () in
-      setup_opera_gdal_auth token;
-      let groups = prepare_s1_opera ~client ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range in
-      printf "Processing Sentinel-1 (%d groups, workers=%d)...\n%!" (List.length groups) n_workers;
-      let (a, ad, d, dd) = process_s1_opera ~roi ~n_workers groups in
-      Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" "";
-      let cov = new_coverage () in
-      cov.found <- List.length groups; cov.valid <- List.length a + List.length d;
-      (a, ad, d, dd, cov) in
+  printf "\nSearching Sentinel-1 (%s)...\n%!" date_range;
+  let s1_params : Stac_client.search_params = {
+    collections = ["sentinel-1-rtc"];
+    bbox = [xmin; ymin; xmax; ymax];
+    datetime = date_range;
+    query = None;
+    limit = None;
+  } in
+  let search_s1 () = sign (with_retries ~label:"S1 STAC search"
+                             (fun () -> Stac_client.search client ~base_url:stac_url s1_params)) in
+  let s1_items = search_s1 () in
+  printf "  Found %d scenes\n%!" (List.length s1_items);
+  printf "Processing Sentinel-1 (workers=%d)...\n%!" n_workers;
+  let research_s1 = memoize_research (if !no_research then None else Some search_s1) in
+  let (s1a, s1ad, s1de, s1dd, cov_s1) =
+    process_s1 ~roi ~n_workers ~research:research_s1 (List.map s_item_of s1_items) in
   printf "  Ascending: %d passes, Descending: %d passes (%.1fs)\n%!"
     (List.length s1a) (List.length s1de) (Unix.gettimeofday () -. t_s1_start);
 

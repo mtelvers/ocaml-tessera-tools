@@ -395,7 +395,6 @@ limits the binding constraint is fleet-wide concurrency, not CPU.
 | `--s2_min_load_frac`, `--s1_min_load_frac` | `$S2_…`/`$S1_…` or 0.9 | Read-starvation thresholds (0 disables) |
 | `--no_research` | off | No STAC re-search on read failures |
 | `--max_cloud` | 100 | STAC `eo:cloud_cover` filter |
-| `--data_source` | `mpc` | `mpc` or `aws` (AWS: earth-search S2 + OPERA RTC S1; not byte-identical) |
 | `--layout`, `--flat_output` | `nested`, off | `flat` puts the seven files in one directory; `--flat_output` drops the per-tile directory |
 
 Exit codes: 0 written, 2 permanent failure, 3 transient failure (re-queue).
@@ -424,7 +423,6 @@ is later placed at. Shard and window addressing never goes through it.
 
 ## Data sources
 
-- Sentinel-2 L2A and Sentinel-1 RTC from Microsoft Planetary Computer
-  (`planetarycomputer.microsoft.com`), the byte-identical path.
-- `--data_source aws`: Sentinel-2 from `earth-search.aws.element84.com`,
-  Sentinel-1 from NASA OPERA RTC-S1 via CMR (needs `~/.edl_bearer_token`).
+Sentinel-2 L2A and Sentinel-1 RTC from Microsoft Planetary Computer
+(`planetarycomputer.microsoft.com`), the same source as the Python worker
+pipeline, so the output is byte-identical to it.
