@@ -11,7 +11,7 @@ Two tools are provided:
 
 - OCaml 5.3.0 with opam
 - GDAL (>= 3.10; 3.11+ recommended for Float16 support)
-- ONNX Runtime shared library (`libonnxruntime.so`)
+- ONNX Runtime shared library (`libonnxruntime.so`), for `tessera-pipeline` only
 
 ## External Repositories
 
@@ -56,7 +56,7 @@ dune exec bin/pipeline.exe -- \
   --repeat_times 1
 ```
 
-### tessera-dpixel — Download and cloud masking
+### tessera-dpixel — Download
 
 Downloads Sentinel-2 L2A and Sentinel-1 RTC for one 0.1° grid tile and writes
 the d-pixel `.npy` arrays. This is a port of the worker pipeline's `dpixel.py`
@@ -122,12 +122,6 @@ of RAM (one month measured at 9.4 GB peak, 3.1 GB output).
 | `--flat_output` | off | Write into `--output` directly instead of `--output/<grid_id>` |
 | `--layout` | `nested` | `nested` (`s2/`, `s1/` subdirectories) or `flat` (all files in one directory) |
 | `--max_cloud` | `100.0` | Max cloud cover % for scene filtering |
-| `--ocm_model_1`, `--ocm_model_2` | unset | OCM ONNX models; OCM runs only if both are given |
-| `--ocm_patch_size` | `0` (auto) | OCM patch size in pixels |
-| `--ocm_batch_size` | `16` | OCM patches per inference batch |
-| `--ocm_patch_overlap` | `300` | OCM overlap pixels for blending |
-| `--ocm_threads` | `4` | ONNX Runtime threads for OCM |
-| `--cuda` | `-1` | CUDA device for OCM inference |
 
 **Concurrency and environment.** `--download_workers` is the per-instance read
 concurrency, the same quantity as dask `num_workers` (4 in `build_tile.py`;
@@ -154,10 +148,6 @@ dB = (20·log10(amp) + 50)·200 as int16, per-date mean over all of the day's
 scenes, emitted once per orbit present. Transient read failures are retried
 once with freshly signed URLs. See the comment on `warp_read` in
 `bin/tessera_dpixel.ml` for how rasterio's WarpedVRT read is reproduced.
-
-**OmniCloudMask:** If both `--ocm_model_1` and `--ocm_model_2` are given, an
-ensemble cloud mask is generated and saved as `mask_optimized.npy` next to
-`bands.npy`.
 
 ### tessera-zarr-upload — Encoder output into the S3 Zarr store
 
@@ -221,4 +211,3 @@ The dpixel tool writes 7-8 `.npy` files per grid tile:
 | `sar_ascending_doy.npy` | (T,) | int16 | Day-of-year for ascending |
 | `sar_descending.npy` | (T,H,W,2) | int16 | S1 descending VV+VH |
 | `sar_descending_doy.npy` | (T,) | int16 | Day-of-year for descending |
-| `mask_optimized.npy` | (T,H,W) | uint8 | OmniCloudMask (optional) |

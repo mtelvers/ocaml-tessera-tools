@@ -10,7 +10,7 @@
  (modules tessera_dpixel)
  (public_name tessera-dpixel)
  (package tessera-dpixel)
- (libraries tessera_common stac_client gdal npy onnxruntime yojson unix bigarray cmdliner))
+ (libraries tessera_common stac_client gdal npy yojson unix bigarray cmdliner))
 
 
 (executable

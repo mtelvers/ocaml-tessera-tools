@@ -1048,212 +1048,6 @@ let save_doys path dtype (doys : int list) =
   let arr = Array.of_list doys in
   Npy.save path (Npy.of_int_array dtype [| Array.length arr |] arr)
 
-(* ======================== OmniCloudMask ======================== *)
-
-(** Per-channel normalize a (3, H, W) float32 bigarray.
-    For each channel: compute mean/std of non-zero pixels, normalize non-zero,
-    leave zeros as 0.0. Returns a new bigarray. *)
-let channel_norm_3chw ~h ~w (src : (float, float32_elt, c_layout) Array1.t) =
-  let out = Array1.create float32 c_layout (3 * h * w) in
-  Array1.fill out 0.0;
-  for c = 0 to 2 do
-    let base = c * h * w in
-    let sum = ref 0.0 in
-    let cnt = ref 0 in
-    for k = 0 to h * w - 1 do
-      let v = Array1.get src (base + k) in
-      if v <> 0.0 then begin sum := !sum +. v; incr cnt end
-    done;
-    if !cnt > 0 then begin
-      let mean = !sum /. Float.of_int !cnt in
-      let sq_sum = ref 0.0 in
-      for k = 0 to h * w - 1 do
-        let v = Array1.get src (base + k) in
-        if v <> 0.0 then begin let d = v -. mean in sq_sum := !sq_sum +. d *. d end
-      done;
-      let std = Float.sqrt (!sq_sum /. Float.of_int !cnt) in
-      let std = if std = 0.0 then 1.0 else std in
-      for k = 0 to h * w - 1 do
-        let v = Array1.get src (base + k) in
-        if v <> 0.0 then Array1.set out (base + k) ((v -. mean) /. std)
-      done
-    end
-  done;
-  out
-
-(** Generate overlapping patch coordinates. Returns list of (top, bottom, left, right). *)
-let make_patch_indexes ~array_height ~array_width ~patch_size ~patch_overlap =
-  let stride = patch_size - patch_overlap in
-  let max_bottom = array_height - patch_size in
-  let max_right = array_width - patch_size in
-  let patches = ref [] in
-  let top = ref 0 in
-  while !top < array_height do
-    let t = if !top > max_bottom then max_bottom else !top in
-    let bottom = t + patch_size in
-    let left = ref 0 in
-    while !left < array_width do
-      let l = if !left > max_right then max_right else !left in
-      let right = l + patch_size in
-      patches := (t, bottom, l, right) :: !patches;
-      left := !left + stride
-    done;
-    top := !top + stride
-  done;
-  List.rev !patches
-
-(** Create gradient blending mask (patch_size x patch_size) as flat float32 bigarray. *)
-let create_gradient_mask ~patch_size ~patch_overlap =
-  let ps = patch_size in
-  let po = if patch_overlap * 2 > ps then ps / 2 else patch_overlap in
-  let grad = Array1.create float32 c_layout (ps * ps) in
-  if po > 0 then begin
-    let fpo = Float.of_int po in
-    for i = 0 to ps - 1 do
-      for j = 0 to ps - 1 do
-        let h_val =
-          if j < po then Float.of_int (j + 1) /. fpo
-          else if j >= ps - po then Float.of_int (ps - j) /. fpo
-          else 1.0 in
-        let v_val =
-          if i < po then Float.of_int (i + 1) /. fpo
-          else if i >= ps - po then Float.of_int (ps - i) /. fpo
-          else 1.0 in
-        Array1.set grad (i * ps + j) (h_val *. v_val)
-      done
-    done
-  end else
-    Array1.fill grad 1.0;
-  grad
-
-(** Run both OCM sessions on one (3, H, W) normalized image.
-    Returns flat (H, W) int array of class predictions (0=clear, 1/2/3=cloud). *)
-let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
-    (norm_img : (float, float32_elt, c_layout) Array1.t) =
-  let ps = patch_size in
-  let patches = make_patch_indexes ~array_height:h ~array_width:w ~patch_size:ps ~patch_overlap in
-  let gradient = create_gradient_mask ~patch_size:ps ~patch_overlap in
-  let pred = Array1.create float32 c_layout (4 * h * w) in
-  Array1.fill pred 0.0;
-  let wsum = Array1.create float32 c_layout (h * w) in
-  Array1.fill wsum 0.0;
-  let seen = Hashtbl.create 256 in
-  let unique_patches = List.filter (fun idx ->
-    if Hashtbl.mem seen idx then false else begin Hashtbl.replace seen idx (); true end) patches in
-  let patch_arr = Array.of_list unique_patches in
-  let n_patches = Array.length patch_arr in
-  let batch_idx = ref 0 in
-  while !batch_idx < n_patches do
-    let actual_b = min batch_size (n_patches - !batch_idx) in
-    let patch_ba = Array1.create float32 c_layout (actual_b * 3 * ps * ps) in
-    Array1.fill patch_ba 0.0;
-    for b = 0 to actual_b - 1 do
-      let (top, _bottom, left, _right) = patch_arr.(!batch_idx + b) in
-      for c = 0 to 2 do
-        for pi = 0 to ps - 1 do
-          for pj = 0 to ps - 1 do
-            let si = top + pi and sj = left + pj in
-            let src_idx = c * h * w + si * w + sj in
-            let dst_idx = ((b * 3 + c) * ps + pi) * ps + pj in
-            Array1.set patch_ba dst_idx (Array1.get norm_img src_idx)
-          done
-        done
-      done
-    done;
-    let all_zero = ref true in
-    for k = 0 to Array1.dim patch_ba - 1 do
-      if Array1.get patch_ba k <> 0.0 then all_zero := false
-    done;
-    if not !all_zero then begin
-      let shape = [| Int64.of_int actual_b; 3L; Int64.of_int ps; Int64.of_int ps |] in
-      let out_size = actual_b * 4 * ps * ps in
-      let out1 = Onnxruntime.Session.run_ba sess1 [| ("input", patch_ba, shape) |] [| "output" |]
-          ~output_sizes:[| out_size |] in
-      let out2 = Onnxruntime.Session.run_ba sess2 [| ("input", patch_ba, shape) |] [| "output" |]
-          ~output_sizes:[| out_size |] in
-      let o1 = out1.(0) and o2 = out2.(0) in
-      for b = 0 to actual_b - 1 do
-        let (top, _bottom, left, _right) = patch_arr.(!batch_idx + b) in
-        for cls = 0 to 3 do
-          for pi = 0 to ps - 1 do
-            for pj = 0 to ps - 1 do
-              let oidx = ((b * 4 + cls) * ps + pi) * ps + pj in
-              let avg = (Array1.get o1 oidx +. Array1.get o2 oidx) *. 0.5 in
-              let gw = Array1.get gradient (pi * ps + pj) in
-              let si = top + pi and sj = left + pj in
-              let pidx = cls * h * w + si * w + sj in
-              Array1.set pred pidx (Array1.get pred pidx +. avg *. gw)
-            done
-          done
-        done;
-        for pi = 0 to ps - 1 do
-          for pj = 0 to ps - 1 do
-            let gw = Array1.get gradient (pi * ps + pj) in
-            let si = top + pi and sj = left + pj in
-            let widx = si * w + sj in
-            Array1.set wsum widx (Array1.get wsum widx +. gw)
-          done
-        done
-      done
-    end;
-    batch_idx := !batch_idx + actual_b
-  done;
-  let result = Array.make (h * w) 0 in
-  for i = 0 to h - 1 do
-    for j = 0 to w - 1 do
-      let idx = i * w + j in
-      let ws = Array1.get wsum idx in
-      if ws > 0.0 then begin
-        let best_cls = ref 0 in
-        let best_val = ref neg_infinity in
-        for cls = 0 to 3 do
-          let v = Array1.get pred (cls * h * w + idx) /. ws in
-          if v > !best_val then begin best_val := v; best_cls := cls end
-        done;
-        result.(idx) <- !best_cls
-      end
-    done
-  done;
-  result
-
-(** Run OmniCloudMask on all timesteps. Returns one (H*W) uint8 frame per timestep. *)
-let run_ocm ~model1_path ~model2_path ~n_threads ~cuda_device
-    ~patch_size ~patch_overlap ~batch_size ~h ~w
-    (bands : u16 list) (masks : u8 list) : u8 list =
-  let n_t = List.length bands in
-  printf "  OCM: %d timesteps, %dx%d\n%!" n_t h w;
-  let env = Onnxruntime.Env.create ~log_level:3 "ocm" in
-  let cuda_opt = if cuda_device >= 0 then Some cuda_device else None in
-  let sess1 = Onnxruntime.Session.create env ~threads:n_threads ?cuda_device:cuda_opt model1_path in
-  let sess2 = Onnxruntime.Session.create env ~threads:n_threads ?cuda_device:cuda_opt model2_path in
-  let ps = if patch_size <= 0 then min 1000 (min h w) else patch_size in
-  let ps = max ps 32 in
-  let po = min patch_overlap (ps / 2) in
-  printf "  OCM patch_size=%d, overlap=%d, batch_size=%d\n%!" ps po batch_size;
-  let hw = h * w in
-  List.mapi (fun t (band_frame, mask_frame) ->
-    (* R(B04=idx0), G(B03=idx2), NIR(B8A=idx4) into (3, H, W) float32 *)
-    let rgn = Array1.create float32 c_layout (3 * hw) in
-    let band_indices = [| 0; 2; 4 |] in
-    for c = 0 to 2 do
-      let bi = band_indices.(c) in
-      for p = 0 to hw - 1 do
-        Array1.set rgn (c * hw + p) (Float.of_int (Array1.get band_frame (p * 10 + bi)))
-      done
-    done;
-    let norm = channel_norm_3chw ~h ~w rgn in
-    let ocm_class = run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size:ps ~patch_overlap:po ~batch_size norm in
-    let out : u8 = Array1.create int8_unsigned c_layout hw in
-    for p = 0 to hw - 1 do
-      let scl_valid = Array1.get mask_frame p = 1 in
-      let ocm_clear = ocm_class.(p) = 0 in
-      let all_zero = Array1.get rgn p = 0.0 && Array1.get rgn (hw + p) = 0.0
-                     && Array1.get rgn (2 * hw + p) = 0.0 in
-      Array1.set out p (if scl_valid && ocm_clear && not all_zero then 1 else 0)
-    done;
-    if (t + 1) mod 10 = 0 || t = n_t - 1 then printf "  [%d/%d] timesteps processed\n%!" (t + 1) n_t;
-    out) (List.combine bands masks)
-
 (* ======================== Main ======================== *)
 
 let () =
@@ -1277,15 +1071,8 @@ let () =
   let s2_min_load_frac = ref (env_float "S2_MIN_LOAD_FRAC" 0.9) in
   let s1_min_load_frac = ref (env_float "S1_MIN_LOAD_FRAC" 0.9) in
   let no_research = ref false in
-  let ocm_model_1 = ref "" in
-  let ocm_model_2 = ref "" in
-  let ocm_patch_size = ref 0 in
-  let ocm_batch_size = ref 16 in
-  let ocm_patch_overlap = ref 300 in
-  let ocm_threads = ref 4 in
   let flat_output = ref false in
   let layout = ref "nested" in
-  let cuda_device = ref (-1) in
 
   let speclist = [
     ("--grid_id", Arg.Set_string grid_id_arg, "Grid id, e.g. grid_51.05_10.35 (tile geometry is derived from it)");
@@ -1303,15 +1090,8 @@ let () =
     ("--s2_min_load_frac", Arg.Set_float s2_min_load_frac, "Min fraction of S2 dates that must load, else exit 3; default $S2_MIN_LOAD_FRAC or 0.9 (0 disables)");
     ("--s1_min_load_frac", Arg.Set_float s1_min_load_frac, "Min fraction of S1 dates that must load, else exit 3; default $S1_MIN_LOAD_FRAC or 0.9 (0 disables)");
     ("--no_research", Arg.Set no_research, "Do not re-search STAC for fresh signed URLs on read failures");
-    ("--ocm_model_1", Arg.Set_string ocm_model_1, "Path to first OCM ONNX model (OCM skipped if not set)");
-    ("--ocm_model_2", Arg.Set_string ocm_model_2, "Path to second OCM ONNX model (OCM skipped if not set)");
-    ("--ocm_patch_size", Arg.Set_int ocm_patch_size, "OCM patch size, 0=auto (default: 0)");
-    ("--ocm_batch_size", Arg.Set_int ocm_batch_size, "OCM patches per batch (default: 16)");
-    ("--ocm_patch_overlap", Arg.Set_int ocm_patch_overlap, "OCM overlap pixels (default: 300)");
-    ("--ocm_threads", Arg.Set_int ocm_threads, "OCM ONNX Runtime threads (default: 4)");
     ("--flat_output", Arg.Set flat_output, "Write into --output directly instead of --output/<grid_id>");
     ("--layout", Arg.Set_string layout, "nested: s2/ and s1/ subdirectories as dpixel.py (default); flat: all .npy in one directory");
-    ("--cuda", Arg.Set_int cuda_device, "CUDA device ID (e.g. 0) for GPU OCM inference");
   ] in
   Arg.parse speclist (fun _ -> ()) "Tessera dpixel download tool";
 
@@ -1471,23 +1251,6 @@ let () =
   save_frames (Filename.concat s1_dir "sar_descending.npy") Npy.Int16 [| h; w; 2 |] bytes_of_i16 s1de;
   save_doys (Filename.concat s1_dir "sar_descending_doy.npy") Npy.Int16 s1dd;
   printf "  Saved 7 .npy files\n%!";
-
-  (* OmniCloudMask: only if both model paths were supplied *)
-  if !ocm_model_1 <> "" && !ocm_model_2 <> "" then begin
-    if not (Sys.file_exists !ocm_model_1) then failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_1);
-    if not (Sys.file_exists !ocm_model_2) then failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_2);
-    if s2_bands <> [] then begin
-      printf "\nRunning OmniCloudMask...\n%!";
-      let t_ocm_start = Unix.gettimeofday () in
-      let mask_opt = run_ocm ~model1_path:!ocm_model_1 ~model2_path:!ocm_model_2
-          ~n_threads:!ocm_threads ~cuda_device:!cuda_device ~patch_size:!ocm_patch_size
-          ~patch_overlap:!ocm_patch_overlap ~batch_size:!ocm_batch_size ~h ~w s2_bands s2_masks in
-      save_frames (Filename.concat s2_dir "mask_optimized.npy") Npy.Uint8 [| h; w |] bytes_of_u8 mask_opt;
-      printf "  Saved mask_optimized.npy (%.1fs)\n%!" (Unix.gettimeofday () -. t_ocm_start)
-    end else
-      printf "\nSkipping OCM: no S2 timesteps\n%!"
-  end else
-    printf "\nSkipping OCM: no --ocm_model_1/--ocm_model_2 given\n%!";
 
   printf "\nDone: %s (%.1fs)\n%!" grid_id (Unix.gettimeofday () -. t_start)
   end in

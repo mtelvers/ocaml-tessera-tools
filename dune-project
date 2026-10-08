@@ -30,7 +30,6 @@
   stac_client
   gdal
   npy
-  onnxruntime
   yojson
   (cmdliner (>= 2.0))))
 
