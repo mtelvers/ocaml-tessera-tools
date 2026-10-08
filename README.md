@@ -1,255 +1,369 @@
-# Tessera OCaml Pipeline
+# ocaml-tessera-tools
 
-An OCaml implementation of the Tessera satellite imagery embedding pipeline. Downloads Sentinel-2 and Sentinel-1 data, preprocesses it (cloud masking, mosaicking, harmonisation), runs ONNX model inference, and outputs quantized int8 embeddings.
+Command-line tools, in OCaml, for producing the Tessera v2 embedding store:
+deciding what to produce, downloading the satellite time series for it,
+and writing the encoder's output into the Zarr store on S3. The encoder
+itself is a separate program; these tools surround it.
 
-Two tools are provided:
+```
+ World Bank boundaries ──► tessera-shard ──► list of shards + live sub-windows
+                                                     │
+                                       tessera-dpixel --shard ZONE:SR:SC --windows …
+                                                     │
+                                   utmZZ/r<ROW>c<COL>/{s2,s1}/*.npy   (one per sub-window)
+                                                     │
+                                            tessera_encode  (C++, external)
+                                                     │
+                                   r<ROW>c<COL>.npy + r<ROW>c<COL>_scales.npy
+                                                     │
+                                       tessera-zarr-upload --zone --sr --sc --year
+                                                     │
+                      s3://bucket/prefix/utmZZ/{embeddings,embeddings_d16,embeddings_d4,scales}/c/…
+```
 
-- **`bin/pipeline.ml`** — Full inference pipeline. Downloads Sentinel-2 and Sentinel-1 data per MGRS tile from Microsoft Planetary Computer (MPC) or AWS, processes spatial blocks, runs ONNX model inference, and outputs int8 embeddings.
-- **`bin/tessera_dpixel.ml`** — Download-only tool (`tessera-dpixel`). Port of the worker pipeline's `dpixel.py`: fetches S2 and S1 for one grid tile and writes the "dpixel" `.npy` files (bands, masks, doys, SAR ascending/descending) byte-identically to it.
+The unit of work is a **shard**: a 4096 × 4096 pixel (41 km) square of a UTM
+zone's 10 m grid, which is also the unit the Zarr store writes as one object
+per array. The unit of memory is a **sub-window**: a 1024 × 1024 pixel cut of
+a shard, which keeps every step's working set at the size of a single
+0.1° tile. Everything is addressed in integer pixels of the store's own zone
+grid, so nothing in this chain projects a tile edge or snaps a coordinate:
+the position of every pixel is decided once, by the grid the store was
+seeded with.
 
-## Prerequisites
-
-- OCaml 5.3.0 with opam
-- GDAL (>= 3.10; 3.11+ recommended for Float16 support)
-- ONNX Runtime shared library (`libonnxruntime.so`), for `tessera-pipeline` only
-
-## External Repositories
-
-These libraries must be cloned and pinned locally via `opam pin`:
-
-| Library | Repository | Description |
-|---------|-----------|-------------|
-| `stac-client` | [mtelvers/stac-client](https://github.com/mtelvers/stac-client) | STAC API search + Planetary Computer token signing |
-| `gdal` | [mtelvers/ocaml-gdal](https://github.com/mtelvers/ocaml-gdal) | GDAL bindings (ctypes-based) |
-| `onnxruntime` | [mtelvers/ocaml-onnxruntime](https://github.com/mtelvers/ocaml-onnxruntime) | ONNX Runtime bindings (ctypes-based) |
-| `npy` | [mtelvers/ocaml-npy](https://github.com/mtelvers/ocaml-npy) | NumPy `.npy` file reader/writer |
+The sections below walk through one shard. Reference tables for each tool's
+options follow at the end.
 
 ## Build
 
-```bash
-# Pin external dependencies (one-time setup)
-opam pin add stac-client https://github.com/mtelvers/stac-client.git -n
-opam pin add gdal https://github.com/mtelvers/ocaml-gdal.git -n
-opam pin add onnxruntime https://github.com/mtelvers/ocaml-onnxruntime.git -n
-opam pin add npy https://github.com/mtelvers/ocaml-npy.git -n
-opam install stac-client gdal onnxruntime npy
+The tools build with [day10](https://github.com/tunbury/day10), which
+assembles the dependency layers from the tunbury opam overlay (the OCaml
+bindings `gdal`, `stac_client`, `npy`, `zarr`, `zarr-s3` and `s3` are pinned
+there by commit):
 
-# Build
-eval $(opam env)
+```bash
 day10 build .
+# binaries in _build/default/bin/: tessera_shard.exe tessera_dpixel.exe
+#                                   tessera_zarr_upload.exe tessera_pipeline.exe
 ```
 
-Note: GDAL ctypes bindings require relaxed C flags. The `dune-workspace` is configured with `-Wno-incompatible-pointer-types` for this reason.
+`.day10` must list the overlay repository **before** the main opam
+repository: upstream has an unrelated package also called `zarr`.
 
-## Usage
-
-### pipeline.exe — Full inference
+There is also a `Dockerfile` for `tessera-dpixel` alone (Debian 13, 547 MB):
 
 ```bash
-LD_LIBRARY_PATH=/path/to/onnxruntime/lib \
-dune exec bin/pipeline.exe -- \
-  --dpixel_dir /tmp/py_cache/grid_51.05_10.35 \
-  --model tessera_model.onnx \
-  --output /tmp/ocaml_out \
-  --batch_size 1024 \
-  --num_threads 20 \
-  --repeat_times 1
+docker build -t tessera-dpixel .
+docker run --rm -v /data:/out tessera-dpixel --grid_id grid_51.05_10.35 \
+  --output /out --start 2024-01-01 --end 2024-12-31
 ```
 
-### tessera-dpixel — Download
+## 1. Decide the work: `tessera-shard`
 
-Downloads Sentinel-2 L2A and Sentinel-1 RTC for one 0.1° grid tile and writes
-the d-pixel `.npy` arrays. This is a port of the worker pipeline's `dpixel.py`
-and its output is byte-identical to it on the default MPC path (verified on
-whole 2017 tiles against `/data/aardvark` on pima, including tiles straddling
-UTM zones). Tile geometry is derived from the grid id alone, exactly as
-`dpixel.load_roi_from_grid_id` does; the all-ones tiffs in
-`global_map_0.1_degree_tiff` are not read.
+`tessera-shard` reads region polygons (the World Bank GAD ADM0 shapefile, a
+genesis `collections.shp`, or any OGR source) and tests them directly
+against a seeded zone grid. It lists every shard the selected regions touch
+and, for each, the row-major indices of the sub-windows that overlap land.
 
 ```bash
-day10 exec . -- dune exec -- tessera-dpixel \
-  --grid_id grid_51.05_10.35 \
-  --output /tmp/dpixel_cache \
-  --start 2024-01-01 \
-  --end 2024-12-31
+tessera-shard --shapefile ~/world_bank/WB_GAD_ADM0_complete.shp \
+  --country "United Kingdom" --zone_grid zone_grids.json --output uk.shards
 ```
 
-Output layout (same as `dpixel.save`): `<output>/<grid_id>/s2/{bands,masks,doys}.npy`
-and `<output>/<grid_id>/s1/sar_{ascending,descending}{,_doy}.npy`.
+`zone_grids.json` is the dump of the destination store's zone geometry
+(origin, pixel size, shard rows and columns per UTM zone), the same numbers
+the store's `utmZZ/zarr.json` carries; `zarr_poc/dump_zone_grids.py` writes
+it. Use the destination's, not a reference store's: shard indices only mean
+anything against the grid they were computed on.
 
-**Container.** `docker build -t tessera-dpixel .` builds only this tool (the
-`Dockerfile` installs the OCaml bindings from the tunbury opam overlay, the
-same commits day10 uses; `.dockerignore` keeps the data in the working tree
-out of the build context). Run it as
-`docker run --rm -v /data:/out tessera-dpixel --grid_id grid_51.05_10.35 --output /out --start 2024-01-01 --end 2024-12-31`;
-pass `-e DOWNLOAD_WORKERS=…` or the flags as usual. Output is written as root.
-The image's GDAL 3.10 / PROJ 9.6 produce byte-identical tiles too.
+Output, one shard per line, sorted by zone, row, column:
 
-**Grid-aligned windows.** Instead of a 0.1° tile the tool can build a window
-cut straight out of a seeded Zarr zone grid, the `zarr_poc/dpixel_window.py`
-mode: `--window ZONE:ROW:COL:HxW` (zone-grid pixel row/col of the top-left
-corner, size in pixels) with `--zone_grid FILE`, where FILE is either a
-`zone_grids.json` dump or a genesis `/work` document (its `grid` object).
-Bounds are exact multiples of the pixel size, so nothing is snapped or cropped;
-south of the equator the imagery is read in the 327xx CRS with the false
-northing added back. Output goes to `<output>/utmZZ/r<ROW>c<COL>/`.
+```
+29:34:10	11,14,15
+29:34:11	2,3,5,6,7,8,9,10,11,12,13,14,15
+30:27:13	0,4
+```
+
+Sub-window indices are row-major within the shard, 0 to 15 for 1024-px
+sub-windows (index = row × 4 + column), the encoding genesis's `/work`
+document and `tessera-dpixel --windows` use.
+
+Rules, inherited from genesis's `Roi` module: rings are clipped to the zone's
+6° band (with a margin) and densified before projecting, so a straight
+lon/lat edge does not bow across a sub-window; a sub-window belongs to the
+zone of its centre longitude; the *request* chooses the shards but *all
+land* chooses the windows, because a shard is written whole and its
+existence means "finished", so a shard holding the Isle of Man and the Mull
+of Galloway must be produced with both; land outside the seeded grid (zones
+seeded short of the pole) is reported, never folded onto the edge. The
+projection is PROJ, through GDAL. `--list` prints the region names
+(World Bank spellings: `Isle of Man (U.K.)`), `--all` takes every region.
+
+What to expect:
+
+| region | shards | live sub-windows | time |
+|---|---|---|---|
+| Isle of Man | 4 | 16 of 64 | 3 s |
+| United Kingdom | 259 | 2,941 of 4,144 | 8 s |
+| whole world (`--all`) | 93,204 | 1,318,114 of 1,491,264 (12 % skipped) | 2 min, 1.6 GB RAM |
+
+On the beta1 grids these are identical to genesis's own enumeration. The
+world list is about 3 MB of text.
+
+## 2. Download: `tessera-dpixel`
+
+Each line of the list is one `tessera-dpixel` run:
 
 ```bash
-day10 exec . -- dune exec -- tessera-dpixel \
-  --window 30:232448:58368:1024x1024 --zone_grid zarr_poc/zone_grids.json \
-  --output /tmp/dpixel_cache --start 2017-01-01 --end 2017-12-31
+tessera-dpixel --shard 30:27:13 --windows 0,4 --zone_grid zone_grids.json \
+  --output /scratch --start 2017-01-01 --end 2017-12-31
 ```
 
-**Shards.** `--shard ZONE:SR:SC` runs every `--subwindow` (default 1024) sub-window
-of Zarr shard (SR, SC) in turn, each written as `utmZZ/r<ROW>c<COL>/` as above, so a
-shard is produced with a tile-sized working set per step and the sixteen outputs
-can be handed to `tessera-zarr-upload --sr SR --sc SC` in one go to write one object
-per array. Already-produced sub-windows are skipped, so a run resumes. A sub-window
-with no Sentinel-2 items at all (open sea) is skipped with a message and left for
-the uploader to fill with `+inf`; only a transient failure makes the run exit 3.
-`--windows 0,5,15` restricts a shard to the listed sub-windows, numbered
-row-major 0..15 exactly as genesis's `/work` document lists the live ones
-(coverage is decided at sub-window level, since a coastal shard is mostly sea).
-A whole 4096-px shard as one `--window` also works, but a year of it needs tens of GB
-of RAM (one month measured at 9.4 GB peak, 3.1 GB output).
+It expands the shard into its 1024-px sub-windows, keeps those named by
+`--windows`, and downloads each in turn from Microsoft Planetary Computer:
+Sentinel-2 L2A (ten bands, SCL cloud mask) and Sentinel-1 RTC (VV, VH), one
+calendar year. The bounds of a sub-window are `origin + 10 m × (col, row)`
+from the zone grid, so the pixels land exactly on the store's grid. The
+output is the "d-pixel", the per-pixel time series the encoder consumes:
 
-**Options:**
+```
+/scratch/
+└── utm30/
+    ├── r110592c53248/              sub-window 0 of shard 27/13 (row 110592, col 53248)
+    │   ├── s2/
+    │   │   ├── bands.npy           (T, 1024, 1024, 10) uint16   B04 B02 B03 B08 B8A B05 B06 B07 B11 B12
+    │   │   ├── masks.npy           (T, 1024, 1024)     uint8    1 = valid observation
+    │   │   └── doys.npy            (T,)                uint16   day of year per S2 date
+    │   └── s1/
+    │       ├── sar_ascending.npy       (Ta, 1024, 1024, 2) int16   VV, VH as (20·log10 + 50)·200
+    │       ├── sar_ascending_doy.npy   (Ta,)               int16
+    │       ├── sar_descending.npy      (Td, 1024, 1024, 2) int16
+    │       └── sar_descending_doy.npy  (Td,)               int16
+    └── r111616c53248/              sub-window 4
+        └── …
+```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--grid_id` | one of these | Grid id of the form `grid_<lon>_<lat>` |
-| `--window` | one of these | Zone-grid window `ZONE:ROW:COL:HxW`; needs `--zone_grid` |
-| `--shard` | one of these | Zarr shard `ZONE:SR:SC`, run as `--subwindow` sub-windows; needs `--zone_grid` |
-| `--shard_px`, `--subwindow` | `4096`, `1024` | Shard side and sub-window side in pixels |
-| `--windows` | all | With `--shard`: comma-separated sub-window indices, row-major, as in genesis `/work` |
-| `--zone_grid` | | Zone grid JSON (`zone_grids.json` dump or genesis `/work` document) |
-| `--output` | (required) | Output directory |
-| `--start` | `2024-01-01` | Start date (YYYY-MM-DD) |
-| `--end` | `2024-12-31` | End date (YYYY-MM-DD, inclusive) |
-| `--data_source` | `mpc` | `mpc` (Planetary Computer, byte-identical path) or `aws` |
-| `--download_workers` | `$DOWNLOAD_WORKERS` or `4` | Concurrent COG reads per instance (OCaml domains). Same lever as dask `num_workers` / `--download-workers` in the Python stack |
-| `--s2_min_load_frac` | `$S2_MIN_LOAD_FRAC` or `0.9` | Min fraction of S2 dates that must load, else exit 3 (0 disables) |
-| `--s1_min_load_frac` | `$S1_MIN_LOAD_FRAC` or `0.9` | Min fraction of S1 dates that must load, else exit 3 (0 disables) |
-| `--no_research` | off | Do not re-search STAC for fresh signed URLs after read failures |
-| `--flat_output` | off | Write into `--output` directly instead of `--output/<grid_id>` |
-| `--layout` | `nested` | `nested` (`s2/`, `s1/` subdirectories) or `flat` (all files in one directory) |
-| `--max_cloud` | `100.0` | Max cloud cover % for scene filtering |
+Sizes for one sub-window and one year, measured on zone 30 in 2017 (51
+cloud-filtered S2 dates, 119 ascending and 118 descending S1 passes):
 
-**Concurrency and environment.** `--download_workers` is the per-instance read
-concurrency, the same quantity as dask `num_workers` (4 in `build_tile.py`;
-the fleet notes in `azure/DOWNLOAD_ENGINE_NOTES.md` keep it at 4 per worker so
-many instances together do not trip MPC throttling). Each concurrent read is
-one OCaml domain; the tool caps this at 120. GDAL reads its own configuration
-from the environment, so `GDAL_NUM_THREADS` (per-warp threads, unset = 1; the
-Python workers use 8), `GDAL_CACHEMAX`, `CPL_VSIL_CURL_CACHE_SIZE` and friends
-apply unchanged; the tool only sets defaults for the stackstac options
-(`GDAL_DISABLE_READDIR_ON_OPEN`, HTTP multi-range, retries) when they are not
-already in the environment. CPU threads per instance are roughly
-`download_workers × GDAL_NUM_THREADS`; there is no BLAS, so the `OMP_*`
-caps have no counterpart. `S2_MIN_LOAD_FRAC` / `S1_MIN_LOAD_FRAC` are honoured
-like in `dpixel.py`.
+| file | size |
+|---|---|
+| `s2/bands.npy` | 1.07 GB (20 MB per S2 date) |
+| `s2/masks.npy` | 53 MB |
+| `s1/sar_ascending.npy` + `sar_descending.npy` | 0.5 GB each (4 MB per pass) |
+| **total per sub-window-year** | **≈ 2.1 GB** |
+| per fully-live shard-year (16 sub-windows) | ≈ 34 GB |
 
-**Exit codes** (the `dpixel.py` coverage policy): `0` tile written; `2` permanent
-failure (no S2 items, or every S2 date genuinely absent) — mark the cell bad;
-`3` transient failure (too many dates lost to read errors) — re-queue.
+Scale with the number of clear S2 dates and S1 passes, so cloudy or
+high-latitude areas differ. One sub-window-year takes about 3.5 minutes on a
+fast link with 32 download workers; the download is latency-bound, not
+bandwidth-bound. This is scratch data: it exists to be encoded and deleted.
 
-**Processing** (matches `dpixel.py`): SCL nearest, spectral bands bilinear,
-per-date first-valid-tile selection with a 0.01 % coverage filter,
-harmonisation (−1000 where ≥ 1000 after 2022-01-25); S1 nearest,
-dB = (20·log10(amp) + 50)·200 as int16, per-date mean over all of the day's
-scenes, emitted once per orbit present. Transient read failures are retried
-once with freshly signed URLs. See the comment on `warp_read` in
-`bin/tessera_dpixel.ml` for how rasterio's WarpedVRT read is reproduced.
+Behaviour worth knowing:
 
-### tessera-shard — Which shards and sub-windows a region covers
+- Sub-windows already on disk are skipped, so an interrupted shard resumes.
+- A sub-window with no Sentinel-2 items at all (open sea) is skipped with a
+  message; the uploader later leaves it as no-data. Only read starvation
+  (too many dates lost to transient errors, MPC throttling) fails the run,
+  with exit code 3, meaning re-queue. For a single tile, exit 2 is a
+  permanent failure (mark the cell bad), 3 transient.
+- Transient read failures are retried once after re-searching STAC for
+  freshly signed URLs, waiting past the current SAS expiry if it is about to
+  roll over.
+- Concurrency: `--download_workers` (or `$DOWNLOAD_WORKERS`, default 4) is
+  the number of simultaneous COG reads per process, the same lever as dask
+  `num_workers` in the Python worker; the fleet notes keep it at 4 so many
+  processes together do not trip MPC throttling. GDAL reads its own
+  configuration from the environment (`GDAL_NUM_THREADS`, `GDAL_CACHEMAX`,
+  …); CPU threads per process are about `download_workers × GDAL_NUM_THREADS`.
+- The 0.1° tile path, `--grid_id grid_<lon>_<lat>`, is also supported. It
+  reproduces the worker pipeline's `dpixel.py` byte for byte (verified by
+  checksum on whole tiles against `/data/aardvark`) and exists for
+  reproducing and ingesting the existing tile archive; new production goes
+  through shards. A whole shard as one `--window 30:110592:53248:4096x4096`
+  works too but needs tens of GB of RAM per year.
 
-`tessera-tiles` for the Zarr store: reads region polygons from the World Bank
-GAD ADM0 shapefile (or a genesis `collections.shp`, or any OGR source) and
-lists, for a seeded zone grid, every shard the selected regions touch and the
-row-major indices of its live 1024-px sub-windows, in the encoding genesis's
-`/work` document and `tessera-dpixel --windows` use.
+## 3. Encode: `tessera_encode` (external)
+
+Inference is spatially blind: it reads one d-pixel directory and writes one
+embedding pair, and nothing in it knows where on Earth the pixels are. The
+v2 encoder used for production is `tessera_encode` in
+`~/endeavour/bench/blocked/` (C++, no Python), invoked per sub-window:
 
 ```bash
-day10 exec . -- dune exec -- tessera-shard \
-  --shapefile ~/world_bank/WB_GAD_ADM0_complete.shp --country "United Kingdom" \
-  --zone_grid zarr_poc/zone_grids.json --output uk.shards
-# 30:27:13	0,4
-# 29:34:11	2,3,5,6,7,8,9,10,11,12,13,14,15
+tessera_encode /scratch/utm30/r110592c53248 /embeddings/ [student_large.tcw]
 ```
 
-It is genesis's `Roi` module with the projection done by PROJ (through GDAL)
-instead of tessera-grid's series, and the same rules: rings clipped to the
-zone band with a margin and densified before projecting, a sub-window owned by
-the zone of its centre longitude, the request choosing the shards but all
-land choosing the windows (a shard is written whole), and land outside the
-seeded grid reported rather than folded in. `--list` prints the region names;
-`--all` takes every region. On the beta1 grids it reproduces genesis's own
-enumeration exactly (United Kingdom: 259 shards, 2,941 of 4,144 sub-windows;
-Isle of Man: 4 shards, 16 sub-windows), in 8 s for the UK.
+It writes, named after the input directory:
 
-Each output line feeds one shard's production:
-`tessera-dpixel --shard 30:27:13 --windows 0,4 …`, inference, then
-`tessera-zarr-upload --zone 30 --sr 27 --sc 13 …`.
+```
+/embeddings/
+├── r110592c53248.npy          (1024, 1024, 128) int8    quantised embedding codes
+└── r110592c53248_scales.npy   (1024, 1024)      float32 per-pixel dequantisation scale
+```
 
-### tessera-zarr-upload — Encoder output into the S3 Zarr store
+128 MiB plus 4 MiB per full sub-window, whatever the number of dates. The
+embedding of a pixel is `code × scale`. A pixel with no observations comes
+out as an all-zero vector with the quantiser's floor scale `1e-12/127`; the
+uploader recognises that signature. See the source for the model, batching
+and thread settings (`OMP_NUM_THREADS`, `TC_BATCH`).
 
-Places encoder output into the shards of the geotessera-layout Zarr v3 store
-(the one the Zarr PoC writes to): per UTM zone, `embeddings` int8
-`(T,128,H,W)`, `embeddings_d16`, `embeddings_d4` and `scales` float32
-`(T,H,W)`, shards of 4096×4096 pixels. Inputs are the `.npy` pairs the
-encoders write, `<name>.npy` int8 `(H,W,128)` plus `<name>_scales.npy`
-float32 `(H,W)`. Each argument is one input, nothing is scanned: a `.npy`
-file (its `_scales` partner must sit beside it) or a directory holding
-`<basename>.npy` and `<basename>_scales.npy`, the archive's
-`<year>/<grid>/<grid>.npy` layout, so `--year 2017 /data/2017/grid_*` works.
-`<name>` is `grid_<lon>_<lat>` for a tile, or `r<ROW>c<COL>` for a window or
-shard sub-window from `tessera-dpixel` (then pass `--zone`; the `utmZZ/`
-directory is not parsed).
+## 4. Upload: `tessera-zarr-upload`
+
+When a shard's sub-windows are all encoded, one call writes the shard:
 
 ```bash
 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
-day10 exec . -- dune exec -- tessera-zarr-upload \
-  --endpoint https://s3.example --bucket tessera-v2 --prefix zarr/v2-world \
-  --year 2017 /data/2017/grid_-0.05_50.75 /data/2017/grid_-0.15_50.75 …
+tessera-zarr-upload --endpoint https://s3.example --bucket tessera-v2 --prefix zarr/v2-world \
+  --zone 30 --sr 27 --sc 13 --year 2017 /embeddings/r110592c53248 /embeddings/r111616c53248
 ```
 
-- The zone grid, extent, codecs and fill values come from the store's own
-  metadata (`utmZZ/zarr.json` `spatial:transform` and the array `zarr.json`s),
-  so the tool cannot write against a different store's geometry.
-- Tiles are placed by geotessera's floor rule, which is the stackstac snapped
-  origin dpixel lays pixels out from (`lib/tile_geom.ml`). Tiles overlap and
-  may straddle up to four shards; every shard the inputs touch is assembled in
-  memory and written as one object per array in the PoC's order, d4, d16,
-  scales, then `embeddings` last as the completion marker (any stale one is
-  deleted first). Restrict to one shard with `--sr`/`--sc`; a shard is only as
-  complete as the inputs you pass.
-- No-data: the encoders mark empty pixels as an all-zero vector with the
-  quantiser floor scale `1e-12/127`, which the (0,1) validity test would
-  accept. Those become NaN scales (covered, no data); pixels nothing covers
-  stay `+inf`. Later inputs overwrite earlier valid pixels; no-data never
-  overwrites data.
-- Shards are encoded with `ocaml-zarr` (byte-identical to zarr-python,
-  Blosc included) using `--domains` cores, and uploaded with multipart PUTs.
-  `--dry_run` places and assembles without writing.
-- Verified against a MinIO store seeded from the published beta1 metadata:
-  zarr-python reads back embeddings, depth prefixes and scales identical to
-  the `.npy`, and the placement matches geotessera's.
+Each argument is one input: a `.npy` file (its `_scales` partner beside it)
+or a directory holding `<basename>.npy` and `<basename>_scales.npy`.
+Nothing is scanned, so pass exactly the sub-windows of the shard. The
+tool reads the zone's origin, extent, codecs and fill values from the
+store's own metadata, assembles a 4096 × 4096 buffer in memory (2 GiB of
+int8 plus 64 MiB of scales), pastes each input at its integer offset, and
+writes four objects in this order:
 
-## Data Sources
+```
+s3://tessera-v2/zarr/v2-world/
+├── zarr.json                                  root group
+└── utm30/
+    ├── zarr.json                              zone group: spatial:transform (origin), proj:code
+    ├── embeddings_d4/c/0/0/27/13              int8  (1, 4,   4096, 4096)   first 4 bands
+    ├── embeddings_d16/c/0/0/27/13             int8  (1, 16,  4096, 4096)   first 16 bands
+    ├── scales/c/0/27/13                       f32   (1, 4096, 4096)
+    └── embeddings/c/0/0/27/13                 int8  (1, 128, 4096, 4096)   written LAST
+```
 
-- **Sentinel-2**: MPC (`planetarycomputer.microsoft.com`) or AWS (`earth-search.aws.element84.com`)
-- **Sentinel-1 (SAR)**: NASA OPERA RTC-S1 via CMR (`cmr.earthdata.nasa.gov`)
+The key is `array/c/<time index>/[band chunk]/<sr>/<sc>`; the time index is
+`year − first year` (2017 is 0). Each object is a Zarr v3 shard: 32 × 32
+pixel inner chunks compressed with Blosc (zstd, bitshuffle), Morton-ordered,
+with an index at the end, byte-identical to what zarr-python writes. The
+`embeddings` object is written last and any stale one deleted first, so its
+presence means the shard is complete; that is how genesis and a resumed run
+know what is done. Inner chunks that are entirely fill are omitted, so an
+empty sea sub-window costs nothing.
 
-## DPixel Output Format
+Scales encode coverage: `+inf` is the fill, "nothing was ever produced
+here"; `NaN` is "produced, no data" (the encoder's all-zero signature, or
+water); finite is valid. Valid pixels of a later input overwrite earlier
+ones; no-data never overwrites data.
 
-The dpixel tool writes 7-8 `.npy` files per grid tile:
+Sizes per shard-year, measured on a fully covered land area and scaled to
+4096 × 4096 (compression is about 59 bytes per pixel for the 128 codes):
 
-| File | Shape | Dtype | Description |
-|------|-------|-------|-------------|
-| `bands.npy` | (T,H,W,10) | uint16 | S2 spectral bands |
-| `masks.npy` | (T,H,W) | uint8 | SCL-derived validity masks |
-| `doys.npy` | (T,) | uint16 | Day-of-year for each S2 timestep |
-| `sar_ascending.npy` | (T,H,W,2) | int16 | S1 ascending VV+VH |
-| `sar_ascending_doy.npy` | (T,) | int16 | Day-of-year for ascending |
-| `sar_descending.npy` | (T,H,W,2) | int16 | S1 descending VV+VH |
-| `sar_descending_doy.npy` | (T,) | int16 | Day-of-year for descending |
+| object | size |
+|---|---|
+| `embeddings` | ≈ 1.0 GB |
+| `embeddings_d16` | ≈ 130 MB |
+| `embeddings_d4` | ≈ 36 MB |
+| `scales` | ≈ 50 MB |
+| **total per shard-year** | **≈ 1.2 GB** (less for partial coverage; sea compresses to nothing) |
+
+Uploads are multipart (64 MiB parts, four in flight); a shard takes about
+10 s to encode and upload on a local network. `--dry_run` assembles without
+writing; `--domains` sets the cores used for compression.
+
+Two things to get right at this step: pass all of a shard's sub-windows in
+one call, since the shard object is replaced, not merged, and make sure the
+`--prefix` store is the one whose `zone_grids.json` the other two steps
+used, since the shard indices mean nothing against another grid.
+
+## Scale of a world-year
+
+From the `--all` enumeration: 93,204 shards, 1.32 million live sub-windows.
+
+| stage | per sub-window | per world-year |
+|---|---|---|
+| d-pixel scratch | ≈ 2.1 GB | ≈ 2.8 PB transient; only sub-windows in flight exist at once |
+| embeddings `.npy` | 132 MiB | ≈ 180 TB transient, deleted after upload |
+| Zarr store | | ≤ 110 TB, four objects per shard |
+
+Download dominates: at a few minutes per sub-window-year and MPC's rate
+limits the binding constraint is fleet-wide concurrency, not CPU.
+
+## Verifying
+
+- dpixel: the `--grid_id` path is byte-identical to `dpixel.py` (sha256 of
+  all seven files on whole 2017 tiles, including a tile straddling two UTM
+  zones, with GDAL 3.8, 3.10 and 3.11); the `--window` path is byte-identical
+  to `zarr_poc/dpixel_window.py`. See `warp_read` in `bin/tessera_dpixel.ml`
+  for how rasterio's WarpedVRT read is reproduced.
+- uploader: against a MinIO store seeded from the published beta1 metadata
+  (`zarr_poc/seed_store.py`), zarr-python reads back embeddings, depth
+  prefixes and scales identical to the `.npy`, and tile placement matches
+  geotessera's converter.
+- shard: counts identical to genesis for the Isle of Man, the United Kingdom
+  and the world.
+
+## Reference
+
+### tessera-shard
+
+| Flag | Default | Description |
+|---|---|---|
+| `--shapefile` | (required) | Region polygons: WB GAD ADM0, a `collections.shp`, or any OGR source |
+| `--country` | | Region name (`NAM_0`), case-insensitive; repeatable |
+| `--all` | off | Every region in the file |
+| `--zone_grid` | (required) | Seeded zone grids JSON |
+| `--shard_px`, `--window` | `4096`, `1024` | Shard and sub-window side in pixels |
+| `--domains` | cores (≤ 32) | Zones processed in parallel |
+| `--output` | stdout | Write the list here |
+| `--list` | | Print the region names and exit |
+
+### tessera-dpixel
+
+| Flag | Default | Description |
+|---|---|---|
+| `--shard` | one of these | `ZONE:SR:SC`; runs its sub-windows in turn; needs `--zone_grid` |
+| `--windows` | all | With `--shard`: comma-separated sub-window indices, row-major |
+| `--window` | one of these | One zone-grid window `ZONE:ROW:COL:HxW`; needs `--zone_grid` |
+| `--grid_id` | one of these | A 0.1° tile `grid_<lon>_<lat>` (legacy path) |
+| `--zone_grid` | | Zone grid JSON (`zone_grids.json` dump, or a genesis `/work` document) |
+| `--shard_px`, `--subwindow` | `4096`, `1024` | Shard and sub-window side in pixels |
+| `--output` | (required) | Output directory; tiles go to `<output>/<grid_id>`, windows to `<output>/utmZZ/r<ROW>c<COL>` |
+| `--start`, `--end` | 2024 | Date range, inclusive |
+| `--download_workers` | `$DOWNLOAD_WORKERS` or 4 | Concurrent COG reads |
+| `--s2_min_load_frac`, `--s1_min_load_frac` | `$S2_…`/`$S1_…` or 0.9 | Read-starvation thresholds (0 disables) |
+| `--no_research` | off | No STAC re-search on read failures |
+| `--max_cloud` | 100 | STAC `eo:cloud_cover` filter |
+| `--data_source` | `mpc` | `mpc` or `aws` (AWS: earth-search S2 + OPERA RTC S1; not byte-identical) |
+| `--layout`, `--flat_output` | `nested`, off | `flat` puts the seven files in one directory; `--flat_output` drops the per-tile directory |
+
+Exit codes: 0 written, 2 permanent failure, 3 transient failure (re-queue).
+
+### tessera-zarr-upload
+
+| Flag | Default | Description |
+|---|---|---|
+| `--endpoint`, `--bucket`, `--prefix` | `$S3_ENDPOINT`, `$S3_BUCKET`, `$S3_PREFIX` | Destination store |
+| `--region` | `$AWS_DEFAULT_REGION` or `us-east-1` | Signing region |
+| `--year`, `--first_year` | , 2017 | Time index = year − first year |
+| `--time_index` | | Overrides the above |
+| `--zone` | | Required for `r<ROW>c<COL>` window inputs |
+| `--sr`, `--sc` | all touched | Only write this shard |
+| `--domains` | 8 | Compression threads |
+| `--dry_run` | off | Assemble, do not write |
+
+Credentials: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else `~/.aws/credentials`.
+
+### tessera-pipeline
+
+The original end-to-end ONNX inference executable (`bin/tessera_pipeline.ml`),
+kept for the v1.1 ONNX model; it needs `libonnxruntime.so` and is not part
+of the shard workflow.
+
+### Shared geometry: `lib/tile_geom.ml`
+
+The 0.1° tile footprint on its UTM grid (dpixel's `load_roi_from_grid_id`
+plus stackstac's snap, computed with PROJ), used by both `tessera-dpixel`
+and `tessera-zarr-upload` so a tile is downloaded for the same footprint it
+is later placed at. Shard and window addressing never goes through it.
+
+## Data sources
+
+- Sentinel-2 L2A and Sentinel-1 RTC from Microsoft Planetary Computer
+  (`planetarycomputer.microsoft.com`), the byte-identical path.
+- `--data_source aws`: Sentinel-2 from `earth-search.aws.element84.com`,
+  Sentinel-1 from NASA OPERA RTC-S1 via CMR (needs `~/.edl_bearer_token`).
