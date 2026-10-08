@@ -42,8 +42,7 @@ there by commit):
 
 ```bash
 day10 build .
-# binaries in _build/default/bin/: tessera_shard.exe tessera_dpixel.exe
-#                                   tessera_zarr_upload.exe tessera_pipeline.exe
+# binaries in _build/default/bin/: tessera_shard.exe tessera_dpixel.exe tessera_zarr_upload.exe
 ```
 
 `.day10` must list the overlay repository **before** the main opam
@@ -347,12 +346,6 @@ Exit codes: 0 written, 2 permanent failure, 3 transient failure (re-queue).
 | `--dry_run` | off | Assemble, do not write |
 
 Credentials: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else `~/.aws/credentials`.
-
-### tessera-pipeline
-
-The original end-to-end ONNX inference executable (`bin/tessera_pipeline.ml`),
-kept for the v1.1 ONNX model; it needs `libonnxruntime.so` and is not part
-of the shard workflow.
 
 ### Shared geometry: `lib/tile_geom.ml`
 

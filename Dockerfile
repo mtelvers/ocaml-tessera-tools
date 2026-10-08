@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# tessera-dpixel: download tool only. tessera-pipeline (ONNX) and
-# tessera-zarr-upload (zarr, s3) are not built here.
+# tessera-dpixel: download tool only. tessera-shard and tessera-zarr-upload
+# (zarr, s3) are not built here.
 FROM ocaml/opam:debian-13-ocaml-5.3 AS build
 RUN sudo ln -sf /usr/bin/opam-2.5 /usr/bin/opam && opam init --reinit -ni
 RUN sudo rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/keep-cache
@@ -22,7 +22,7 @@ WORKDIR /src
 COPY --chown=opam --link dune-project dune-workspace ./
 COPY --chown=opam --link lib/ lib/
 COPY --chown=opam --link bin/tessera_dpixel.ml bin/
-# Only the dpixel stanza: the repo's bin/dune also declares the pipeline and
+# Only the dpixel stanza: the repo's bin/dune also declares tessera-shard and
 # the Zarr uploader, whose dependencies this image does not install.
 RUN echo '(executable (name tessera_dpixel) (modules tessera_dpixel) (libraries tessera_common stac_client gdal npy yojson unix bigarray cmdliner))' > bin/dune
 RUN opam exec -- dune build bin/tessera_dpixel.exe

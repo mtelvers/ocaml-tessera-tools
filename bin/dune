@@ -1,11 +1,4 @@
 (executable
- (name tessera_pipeline)
- (modules tessera_pipeline)
- (public_name tessera-pipeline)
- (package tessera-pipeline)
- (libraries stac_client gdal onnxruntime yojson unix bigarray))
-
-(executable
  (name tessera_dpixel)
  (modules tessera_dpixel)
  (public_name tessera-dpixel)
