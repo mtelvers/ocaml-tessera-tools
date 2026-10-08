@@ -207,48 +207,7 @@ let roi_of_grid lon lat =
 
 (* ======================== Grid-aligned windows ======================== *)
 
-(** A seeded Zarr zone grid (zarr_poc/zonegrid.py ZoneGrid). origin_y is the
-    CANONICAL northing: no false northing, negative south of the equator, so
-    one grid is continuous across both hemispheres. *)
-type zone_grid = {
-  zg_zone : int;
-  zg_epsg : int;          (* canonical northern EPSG, 326xx *)
-  zg_origin_x : float;
-  zg_origin_y : float;
-  zg_pixel : float;
-  zg_width_px : int;
-  zg_height_px : int;
-}
-
-(** Read a zone grid from either a `zone_grids.json` dump
-    ({"zones": {"30": {origin_x, origin_y, pixel, width_px, height_px, epsg}}})
-    or a genesis /work document ({"zone": 30, "grid": {origin_x, ...}}). *)
-let zone_grid_of_file path zone =
-  let json = Yojson.Safe.from_file path in
-  let member k = function `Assoc l -> List.assoc_opt k l | _ -> None in
-  let num = function Some (`Float f) -> f | Some (`Int i) -> Float.of_int i
-                   | _ -> failwith ("zone grid: missing numeric field in " ^ path) in
-  let int = function Some (`Int i) -> i | Some (`Float f) -> Float.to_int f
-                   | _ -> failwith ("zone grid: missing integer field in " ^ path) in
-  let g = match member "zones" json with
-    | Some zones ->
-      (match member (Printf.sprintf "%02d" zone) zones with
-       | Some g -> g
-       | None -> failwith (Printf.sprintf "zone grid: no zone %02d in %s" zone path))
-    | None ->
-      (match member "grid" json with
-       | Some g ->
-         (match member "zone" json with
-          | Some (`Int z) when z <> zone ->
-            failwith (Printf.sprintf "zone grid: %s describes zone %d, not %d" path z zone)
-          | _ -> ());
-         g
-       | None -> failwith ("zone grid: neither \"zones\" nor \"grid\" in " ^ path)) in
-  let epsg = match member "epsg" g with Some _ as e -> int e | None -> 32600 + zone in
-  { zg_zone = zone; zg_epsg = epsg;
-    zg_origin_x = num (member "origin_x" g); zg_origin_y = num (member "origin_y" g);
-    zg_pixel = (match member "pixel" g with Some _ as p -> num p | None -> 10.0);
-    zg_width_px = int (member "width_px" g); zg_height_px = int (member "height_px" g) }
+module Zone_grid = Tessera_common.Zone_grid
 
 (** zonegrid.window_bbox_lonlat: lon/lat bbox of a projected window for the
     STAC search, sampling the edges (a straight projected edge bows in lon/lat)
@@ -273,23 +232,22 @@ let window_bbox_lonlat ~epsg (left, bottom, right, top) =
   let margin = 0.01 in
   (fmin lons -. margin, fmin lats -. margin, fmax lons +. margin, fmax lats +. margin)
 
-(** zarr_poc/dpixel_window.build_window geometry: a window cut from the zone
-    grid at pixel (row, col), h x w pixels. Bounds are exact multiples of the
+(** A window cut from the zone grid at pixel (row, col), h x w pixels. Bounds are exact multiples of the
     pixel size so the stackstac snap is a no-op and nothing is cropped. The
     imagery is read in the real CRS: south of the equator that is the 327xx
     code and +10,000 km of northing. *)
-let roi_of_window (g : zone_grid) ~row ~col ~h ~w =
+let roi_of_window (g : Zone_grid.t) ~row ~col ~h ~w =
   if row < 0 || col < 0 || h <= 0 || w <= 0
-     || row + h > g.zg_height_px || col + w > g.zg_width_px then
+     || row + h > g.height_px || col + w > g.width_px then
     failwith (Printf.sprintf "window r%dc%d %dx%d does not fit zone %02d grid (%d x %d px)"
-                row col h w g.zg_zone g.zg_width_px g.zg_height_px);
-  let px = g.zg_pixel in
-  let left = g.zg_origin_x +. Float.of_int col *. px in
-  let top = g.zg_origin_y -. Float.of_int row *. px in
+                row col h w g.zone g.width_px g.height_px);
+  let px = g.pixel in
+  let left = g.origin_x +. Float.of_int col *. px in
+  let top = g.origin_y -. Float.of_int row *. px in
   let bottom = top -. Float.of_int h *. px in
   let right = left +. Float.of_int w *. px in
   let south = bottom < 0.0 in
-  let epsg = if south then g.zg_epsg + 100 else g.zg_epsg in
+  let epsg = if south then g.epsg + 100 else g.epsg in
   let adj n = if south then n +. 10_000_000.0 else n in
   let bounds = (left, adj bottom, right, adj top) in
   let (minx, miny, maxx, maxy) as gb = snapped_bounds bounds px in
@@ -1081,8 +1039,8 @@ let () =
     ("--shard", Arg.Set_string shard_arg, "Zarr shard ZONE:SR:SC: run every --subwindow sub-window of it in turn (needs --zone_grid)");
     ("--shard_px", Arg.Set_int shard_px, "Shard side in pixels (default 4096)");
     ("--subwindow", Arg.Set_int subwindow, "Sub-window side for --shard; must divide --shard_px (default 1024)");
-    ("--windows", Arg.Set_string windows_arg, "With --shard: only these sub-windows, comma-separated indices row-major (0..n*n-1), genesis's /work \"windows\" list");
-    ("--zone_grid", Arg.Set_string zone_grid_arg, "Zone grid JSON: a zone_grids.json dump or a genesis /work document");
+    ("--windows", Arg.Set_string windows_arg, "With --shard: only these sub-windows, comma-separated indices, row-major 0..n*n-1");
+    ("--zone_grid", Arg.Set_string zone_grid_arg, "Seeded zone grid: the store's base URL (…/zarr/<dataset>) or a zone_grids.json dump from tessera-shard");
     ("--output", Arg.Set_string output_dir, "Output directory for dpixel .npy files");
     ("--start", Arg.Set_string start_date, "Start date (YYYY-MM-DD)");
     ("--end", Arg.Set_string end_date, "End date (YYYY-MM-DD)");
@@ -1142,17 +1100,17 @@ let () =
     end else if !window_arg <> "" then begin
       match parse_window !window_arg with
       | Some (zone, row, col, h, w) ->
-        [ (window_id zone row col, roi_of_window (zone_grid_of_file !zone_grid_arg zone) ~row ~col ~h ~w) ]
+        [ (window_id zone row col, roi_of_window (Zone_grid.load !zone_grid_arg zone) ~row ~col ~h ~w) ]
       | None -> failwith (Printf.sprintf "%s is not of the form ZONE:ROW:COL:HxW" !window_arg)
     end else begin
       match String.split_on_char ':' !shard_arg with
       | [ z; r; c ] ->
         let zone = int_of_string z and sr = int_of_string r and sc = int_of_string c in
-        let g = zone_grid_of_file !zone_grid_arg zone in
+        let g = Zone_grid.load !zone_grid_arg zone in
         let n = !subwindow and sp = !shard_px in
         let per_side = sp / n in
-        (* Sub-window index = row-major position in the shard, as genesis and
-           the PoC number them, independent of clipping at the grid edge. *)
+        (* Sub-window index = row-major position in the shard, independent of
+           clipping at the grid edge. *)
         let wanted = match !windows_arg with
           | "" -> None
           | l -> Some (List.map (fun x -> int_of_string (String.trim x)) (String.split_on_char ',' l)) in
@@ -1160,7 +1118,7 @@ let () =
           List.filter_map (fun dc ->
             let idx = dr * per_side + dc in
             let row = sr * sp + dr * n and col = sc * sp + dc * n in
-            let h = min n (g.zg_height_px - row) and w = min n (g.zg_width_px - col) in
+            let h = min n (g.height_px - row) and w = min n (g.width_px - col) in
             if h <= 0 || w <= 0 then None
             else if (match wanted with Some l -> not (List.mem idx l) | None -> false) then None
             else Some (window_id zone row col, roi_of_window g ~row ~col ~h ~w))

@@ -29,6 +29,7 @@
   (ocaml (>= 5.1))
   (dune (>= 3.0))
   gdal
+  stac_client
   npy
   zarr
   zarr-blosc
@@ -47,4 +48,5 @@
   (dune (>= 3.0))
   tessera-grid
   gdal
+  stac_client
   yojson))

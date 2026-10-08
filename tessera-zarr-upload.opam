@@ -12,6 +12,7 @@ depends: [
   "ocaml" {>= "5.1"}
   "dune" {>= "3.0" & >= "3.0"}
   "gdal"
+  "stac_client"
   "npy"
   "zarr"
   "zarr-blosc"

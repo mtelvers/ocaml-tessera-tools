@@ -2,15 +2,13 @@
    covers.
 
    Reads region polygons from any OGR source (the World Bank GAD ADM0
-   shapefile, or a collections.shp built by genesis's import scripts; both
-   name features in NAM_0), selects the requested countries, and tests them
-   directly against a seeded zone grid: every --window px sub-window whose
-   square overlaps land is live, and a shard is listed with the row-major
-   bitmask of its live sub-windows, the encoding genesis's /work document and
-   tessera-dpixel --windows use.
+   shapefile, features named in NAM_0), selects the requested countries, and
+   tests them directly against a seeded zone grid: every --window px
+   sub-window whose square overlaps land is live, and a shard is listed with
+   the row-major indices of its live sub-windows, as tessera-dpixel --windows
+   takes them.
 
-   This is genesis's Roi module (bin/roi.ml) with the projection done by PROJ
-   through GDAL instead of tessera-grid's series, and the same rules:
+   The projection is PROJ through GDAL; the rules:
 
    - Rings are clipped to the zone's 6 degree band with a 1.5 degree margin
      before projecting (transverse Mercator diverges far from its meridian),
@@ -33,29 +31,7 @@ module Geo = Tessera_grid.Geo
 
 let eprintf fmt = Printf.eprintf fmt
 
-(* ======================== Zone grids ======================== *)
-
-type zone_grid = {
-  zone : int;
-  origin_x : float;
-  origin_y : float;      (* canonical northing of the top-left corner *)
-  pixel : float;
-  shard_rows : int;
-  shard_cols : int;
-}
-
-let load_grids path =
-  let json = Yojson.Safe.from_file path in
-  let open Yojson.Safe.Util in
-  let tbl = Hashtbl.create 64 in
-  json |> member "zones" |> to_assoc
-  |> List.iter (fun (_, z) ->
-         let i k = z |> member k |> to_int in
-         let f k = z |> member k |> to_number in
-         let g = { zone = i "zone"; origin_x = f "origin_x"; origin_y = f "origin_y";
-                   pixel = f "pixel"; shard_rows = i "shard_rows"; shard_cols = i "shard_cols" } in
-         Hashtbl.replace tbl g.zone g);
-  tbl
+module Zone_grid = Tessera_common.Zone_grid
 
 (* ======================== Regions from OGR ======================== *)
 
@@ -110,7 +86,7 @@ let load_regions path : Geo.polygon list =
   | Ok (Ok p) -> p
   | Ok (Error e) | Error e -> failwith (Printf.sprintf "%s: %s" path e)
 
-(* ======================== Geometry (genesis Roi) ======================== *)
+(* ======================== Geometry ======================== *)
 
 let max_edge_deg = 0.05
 let clip_margin_deg = 1.5
@@ -229,7 +205,7 @@ let rect_overlaps ~lo_x ~lo_y ~hi_x ~hi_y (preps : Geo.prepared) =
 
 (** Live (shard row, shard col, sub-window bitmask) for one zone, and the
     number of land sub-windows that fall outside the seeded grid. *)
-let live_windows (pr : proj) (g : zone_grid) ~shard_px ~win (polys : Geo.polygon list) =
+let live_windows (pr : proj) (g : Zone_grid.t) ~shard_px ~win (polys : Geo.polygon list) =
   let preps = prepare_for_zone pr ~zone:g.zone polys in
   if preps = [] then ([], 0)
   else begin
@@ -319,11 +295,13 @@ let () =
   let domains = ref (max 1 (min 32 (Domain.recommended_domain_count ()))) in
   let output = ref "" in
   let list_names = ref false in
+  let dump_grid = ref "" in
   let speclist = [
-    ("--shapefile", Arg.Set_string shapefile, "Region polygons: WB_GAD_ADM0_complete.shp, a collections.shp, or any OGR source");
+    ("--shapefile", Arg.Set_string shapefile, "Region polygons: WB_GAD_ADM0_complete.shp or any OGR source with a NAM_0/name field");
     ("--country", Arg.String (fun c -> countries := c :: !countries), "Region name (NAM_0), case-insensitive; repeatable");
     ("--all", Arg.Set all_regions, "Every region in the file");
-    ("--zone_grid", Arg.Set_string zone_grid, "Seeded zone grids JSON (zone_grids.json dump)");
+    ("--zone_grid", Arg.Set_string zone_grid, "Seeded zone grid: the store's base URL (…/zarr/<dataset>) or a zone_grids.json dump");
+    ("--dump_zone_grid", Arg.Set_string dump_grid, "Write the zone grids read from --zone_grid to this JSON file (for offline use by the other tools)");
     ("--shard_px", Arg.Set_int shard_px, "Shard side in pixels (default 4096)");
     ("--window", Arg.Set_int win, "Sub-window side in pixels (default 1024)");
     ("--domains", Arg.Set_int domains, "Zones processed in parallel (default: cores, max 32)");
@@ -331,17 +309,26 @@ let () =
     ("--list", Arg.Set list_names, "List the region names in the file and exit");
   ] in
   Arg.parse speclist (fun _ -> ()) "tessera-shard: live Zarr shards and sub-windows of a region";
-  if !shapefile = "" then failwith "--shapefile is required";
   if !shard_px mod !win <> 0 then failwith "--window must divide --shard_px";
+  if !zone_grid = "" then failwith "--zone_grid is required";
   Gdal.init ();
+  let grids = Zone_grid.load_all !zone_grid in
+  eprintf "%s: %d zone grid(s)\n%!" !zone_grid (Hashtbl.length grids);
+  if !dump_grid <> "" then begin
+    let dataset = Filename.basename !zone_grid in
+    let oc = open_out !dump_grid in
+    Zone_grid.dump oc ~dataset grids;
+    close_out oc;
+    eprintf "wrote %s\n%!" !dump_grid;
+    if !shapefile = "" then exit 0
+  end;
+  if !shapefile = "" then failwith "--shapefile is required";
   let records = load_regions !shapefile in
   if !list_names then begin
     List.iter (fun (p : Geo.polygon) -> print_endline p.name) records;
     exit 0
   end;
-  if !zone_grid = "" then failwith "--zone_grid is required";
   if !countries = [] && not !all_regions then failwith "--country or --all is required";
-  let grids = load_grids !zone_grid in
   let lower = String.lowercase_ascii in
   let selected =
     if !all_regions then records

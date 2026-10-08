@@ -1,4 +1,5 @@
-; Geometry shared by tessera-dpixel and tessera-zarr-upload.
+; Shared by tessera-shard, tessera-dpixel and tessera-zarr-upload: tile
+; geometry (PROJ via GDAL) and the seeded zone grid read from the store.
 (library
  (name tessera_common)
- (libraries gdal))
+ (libraries gdal stac_client yojson))

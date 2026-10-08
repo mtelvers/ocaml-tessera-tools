@@ -104,7 +104,7 @@ apptainer exec --env DOWNLOAD_WORKERS=4 --bind /scratch tessera-tools.sif \
 # 4. upload the shard
 apptainer exec --env AWS_ACCESS_KEY_ID=… --env AWS_SECRET_ACCESS_KEY=… \
   --bind /scratch tessera-tools.sif \
-  tessera-zarr-upload --endpoint https://s3.example --bucket tessera-v2 \
+  tessera-zarr-upload --endpoint https://s3.example --bucket tessera \
   --prefix zarr/v2-world --zone 30 --sr 27 --sc 13 --year 2017 \
   /scratch/emb/r110592c53248 /scratch/emb/r111616c53248
 ```
@@ -117,8 +117,8 @@ Slurm array over the lines of `uk.shards` is the natural way to run it.
 
 ## 1. Decide the work: `tessera-shard`
 
-`tessera-shard` reads region polygons (the World Bank GAD ADM0 shapefile, a
-genesis `collections.shp`, or any OGR source) and tests them directly
+`tessera-shard` reads region polygons (the World Bank GAD ADM0 shapefile, or
+any OGR source with a `NAM_0` or `name` field) and tests them directly
 against a seeded zone grid. It lists every shard the selected regions touch
 and, for each, the row-major indices of the sub-windows that overlap land.
 
@@ -127,11 +127,20 @@ tessera-shard --shapefile ~/world_bank/WB_GAD_ADM0_complete.shp \
   --country "United Kingdom" --zone_grid zone_grids.json --output uk.shards
 ```
 
-`zone_grids.json` is the dump of the destination store's zone geometry
-(origin, pixel size, shard rows and columns per UTM zone), the same numbers
-the store's `utmZZ/zarr.json` carries; `zarr_poc/dump_zone_grids.py` writes
-it. Use the destination's, not a reference store's: shard indices only mean
-anything against the grid they were computed on.
+`--zone_grid` is the destination store's zone geometry (origin, pixel size,
+shard rows and columns per UTM zone), read from the store's own
+`utmZZ/zarr.json` files. Give it the store's base URL directly, e.g.
+`https://data.source.coop/tessera/tessera/zarr/v2-2B-L~beta1`, or write a
+file once for offline use and pass that to every tool:
+
+```bash
+tessera-shard \
+  --zone_grid https://data.source.coop/tessera/tessera/zarr/v2-2B-L~beta1 \
+  --dump_zone_grid zone_grids.json
+```
+
+Use the destination's grid, not a reference store's: shard indices only
+mean anything against the grid they were computed on.
 
 Output, one shard per line, sorted by zone, row, column:
 
@@ -145,7 +154,7 @@ Sub-window indices are row-major within the shard, 0 to 15 for 1024-px
 sub-windows (index = row × 4 + column), as `tessera-dpixel --windows`
 takes them.
 
-Rules, inherited from genesis's `Roi` module: rings are clipped to the zone's
+Rules: rings are clipped to the zone's
 6° band (with a margin) and densified before projecting, so a straight
 lon/lat edge does not bow across a sub-window; a sub-window belongs to the
 zone of its centre longitude; the *request* chooses the shards but *all
@@ -164,8 +173,7 @@ What to expect:
 | United Kingdom | 259 | 2,941 of 4,144 | 8 s |
 | world (`--all`) | 93,204 | 1,318,114 of 1,491,264 (12 % skipped) | 2 min, 1.6 GB |
 
-On the beta1 grids these are identical to genesis's own enumeration. The
-world list is about 3 MB of text.
+The world list is about 3 MB of text.
 
 ## 2. Download: `tessera-dpixel`
 
@@ -242,10 +250,10 @@ Behaviour worth knowing:
 
 ## 3. Encode: `tessera_encode` (external)
 
-Inference is spatially blind: it reads one d-pixel directory and writes one
-embedding pair, and nothing in it knows where on Earth the pixels are. The
-v2 encoder used for production is `tessera_encode` in
-`~/endeavour/bench/blocked/` (C++, no Python), invoked per sub-window:
+Inference reads one d-pixel directory and writes one embedding pair;
+where the pixels are does not enter into it. The v2 encoder used for
+production is `tessera_encode` (C++, from the encoder repository), invoked
+per sub-window:
 
 ```bash
 tessera_encode /scratch/utm30/r110592c53248 /embeddings/ [student_large.tcw]
@@ -271,7 +279,7 @@ When a shard's sub-windows are all encoded, one call writes the shard:
 
 ```bash
 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
-tessera-zarr-upload --endpoint https://s3.example --bucket tessera-v2 \
+tessera-zarr-upload --endpoint https://s3.example --bucket tessera \
   --prefix zarr/v2-world --zone 30 --sr 27 --sc 13 --year 2017 \
   /embeddings/r110592c53248 /embeddings/r111616c53248
 ```
@@ -285,7 +293,7 @@ int8 plus 64 MiB of scales), pastes each input at its integer offset, and
 writes four objects in this order:
 
 ```
-s3://tessera-v2/zarr/v2-world/
+s3://tessera/zarr/v2-world/
 ├── zarr.json                                  root group
 └── utm30/
     ├── zarr.json                    zone group: spatial:transform, proj:code
@@ -300,9 +308,9 @@ The key is `array/c/<time index>/[band chunk]/<sr>/<sc>`; the time index is
 pixel inner chunks compressed with Blosc (zstd, bitshuffle), Morton-ordered,
 with an index at the end, byte-identical to what zarr-python writes. The
 `embeddings` object is written last and any stale one deleted first, so its
-presence means the shard is complete; that is how genesis and a resumed run
-know what is done. Inner chunks that are entirely fill are omitted, so an
-empty sea sub-window costs nothing.
+presence means the shard is complete; that is how a resumed run knows what
+is done. Inner chunks that are entirely fill are omitted, so a sub-window
+that was never produced costs nothing in the store.
 
 Scales encode coverage: `+inf` is the fill, "nothing was ever produced
 here"; `NaN` is "produced, no data" (the encoder's all-zero signature, or
@@ -318,7 +326,7 @@ Sizes per shard-year, measured on a fully covered land area and scaled to
 | `embeddings_d16` | ≈ 130 MB |
 | `embeddings_d4` | ≈ 36 MB |
 | `scales` | ≈ 50 MB |
-| **total per shard-year** | **≈ 1.2 GB** (less for partial coverage; sea compresses to nothing) |
+| **total per shard-year** | **≈ 1.2 GB**; less where sub-windows were not produced |
 
 Uploads are multipart (64 MiB parts, four in flight); a shard takes about
 10 s to encode and upload on a local network. `--dry_run` assembles without
@@ -344,17 +352,16 @@ limits the binding constraint is fleet-wide concurrency, not CPU.
 
 ## Verifying
 
-- dpixel: the `--grid_id` path is byte-identical to `dpixel.py` (sha256 of
-  all seven files on whole 2017 tiles, including a tile straddling two UTM
-  zones, with GDAL 3.8, 3.10 and 3.11); the `--window` path is byte-identical
-  to `zarr_poc/dpixel_window.py`. See `warp_read` in `bin/tessera_dpixel.ml`
-  for how rasterio's WarpedVRT read is reproduced.
-- uploader: against a MinIO store seeded from the published beta1 metadata
-  (`zarr_poc/seed_store.py`), zarr-python reads back embeddings, depth
-  prefixes and scales identical to the `.npy`, and tile placement matches
-  geotessera's converter.
-- shard: counts identical to genesis for the Isle of Man, the United Kingdom
-  and the world.
+- dpixel: both the `--grid_id` and the `--window` paths are byte-identical
+  to the Python worker pipeline they port (sha256 of all seven files on whole
+  2017 tiles and windows, including a tile straddling two UTM zones, with
+  GDAL 3.8, 3.10 and 3.11). See `warp_read` in `bin/tessera_dpixel.ml` for
+  how rasterio's WarpedVRT read is reproduced.
+- uploader: against a MinIO store seeded from the published beta1 metadata,
+  zarr-python reads back embeddings, depth prefixes and scales identical to
+  the `.npy`, and tile placement matches geotessera's converter.
+- shard: enumerations identical to the production orchestrator's for the
+  Isle of Man, the United Kingdom and the world.
 
 ## Reference
 
@@ -362,10 +369,11 @@ limits the binding constraint is fleet-wide concurrency, not CPU.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--shapefile` | (required) | Region polygons: WB GAD ADM0, a `collections.shp`, or any OGR source |
+| `--shapefile` | (required) | Region polygons: WB GAD ADM0 or any OGR source |
 | `--country` | | Region name (`NAM_0`), case-insensitive; repeatable |
 | `--all` | off | Every region in the file |
-| `--zone_grid` | (required) | Seeded zone grids JSON |
+| `--zone_grid` | (required) | Store base URL or `zone_grids.json` |
+| `--dump_zone_grid` | | Write the zone grids to this JSON file |
 | `--shard_px`, `--window` | `4096`, `1024` | Shard and sub-window side in pixels |
 | `--domains` | cores (≤ 32) | Zones processed in parallel |
 | `--output` | stdout | Write the list here |
@@ -379,7 +387,7 @@ limits the binding constraint is fleet-wide concurrency, not CPU.
 | `--windows` | all | With `--shard`: comma-separated sub-window indices, row-major |
 | `--window` | one of these | One zone-grid window `ZONE:ROW:COL:HxW`; needs `--zone_grid` |
 | `--grid_id` | one of these | A 0.1° tile `grid_<lon>_<lat>` (legacy path) |
-| `--zone_grid` | | Zone grid JSON (`zone_grids.json` dump, or a genesis `/work` document) |
+| `--zone_grid` | | Store base URL or `zone_grids.json` from `tessera-shard --dump_zone_grid` |
 | `--shard_px`, `--subwindow` | `4096`, `1024` | Shard and sub-window side in pixels |
 | `--output` | (required) | Output directory; tiles go to `<output>/<grid_id>`, windows to `<output>/utmZZ/r<ROW>c<COL>` |
 | `--start`, `--end` | 2024 | Date range, inclusive |
