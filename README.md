@@ -121,7 +121,8 @@ apptainer exec --bind /rds/world_bank:/wb:ro tessera-tools.sif \
 
 # 2. download one shard's live sub-windows (one line of uk.shards)
 apptainer exec --env DOWNLOAD_WORKERS=4 --bind /scratch tessera-tools.sif \
-  tessera-dpixel --shard 30:27:13 --windows 0,4 --zone_grid zone_grids.json \
+  tessera-dpixel --shard 30:106:13 --windows 0,1,4,5,8,9 \
+  --zone_grid zone_grids.json \
   --output /scratch/dpixel --start 2017-01-01 --end 2017-12-31
 
 # 3. encode (tessera_encode, outside this image)
@@ -130,8 +131,8 @@ apptainer exec --env DOWNLOAD_WORKERS=4 --bind /scratch tessera-tools.sif \
 apptainer exec --env AWS_ACCESS_KEY_ID=… --env AWS_SECRET_ACCESS_KEY=… \
   --bind /scratch tessera-tools.sif \
   tessera-zarr-upload --endpoint https://s3.example --bucket tessera \
-  --prefix zarr/v2-world --zone 30 --sr 27 --sc 13 --year 2017 \
-  /scratch/emb/r110592c53248 /scratch/emb/r111616c53248
+  --prefix zarr/v2-world --zone 30 --sr 106 --sc 13 --year 2017 \
+  /scratch/emb/r434176c53248 /scratch/emb/r435200c53248
 ```
 
 Environment variables pass with `--env NAME=value` (or by exporting
@@ -170,9 +171,9 @@ mean anything against the grid they were computed on.
 Output, one shard per line, sorted by zone, row, column:
 
 ```
-29:34:10	11,14,15
-29:34:11	2,3,5,6,7,8,9,10,11,12,13,14,15
-30:27:13	0,4
+29:85:11	15
+29:85:12	8,9,12,13
+30:106:13	0,1,4,5,8,9
 ```
 
 Sub-window indices are row-major within the shard, 0 to 15 for 1024-px
@@ -194,18 +195,19 @@ What to expect:
 
 | region | shards | live sub-windows | time |
 |---|---|---|---|
-| Isle of Man | 4 | 16 of 64 | 3 s |
-| United Kingdom | 259 | 2,941 of 4,144 | 8 s |
-| world (`--all`) | 93,204 | 1,318,114 of 1,491,264 (12 % skipped) | 2 min, 1.6 GB |
+| Isle of Man | 4 | 18 of 64 | 3 s |
+| United Kingdom | 265 | 2,921 of 4,240 | 6 s |
+| world (`--all`) | 94,938 | 1,327,963 of 1,519,008 (13 % skipped) | 2 min, 1.6 GB |
 
-The world list is about 3 MB of text.
+The world list is about 4 MB of text.
 
 ## 2. Download: `tessera-dpixel`
 
 Each line of the list is one `tessera-dpixel` run:
 
 ```bash
-tessera-dpixel --shard 30:27:13 --windows 0,4 --zone_grid zone_grids.json \
+tessera-dpixel --shard 30:106:13 --windows 0,1,4,5,8,9 \
+  --zone_grid zone_grids.json \
   --output /scratch --start 2017-01-01 --end 2017-12-31
 ```
 
@@ -219,7 +221,7 @@ output is the "d-pixel", the per-pixel time series the encoder consumes:
 ```
 /scratch/
 └── utm30/
-    ├── r110592c53248/              sub-window 0 of shard 27/13
+    ├── r434176c53248/              sub-window 0 of shard 106/13
     │   ├── s2/
     │   │   ├── bands.npy     (T, 1024, 1024, 10) uint16  10 S2 bands
     │   │   ├── masks.npy     (T, 1024, 1024)     uint8   1 = valid
@@ -229,7 +231,7 @@ output is the "d-pixel", the per-pixel time series the encoder consumes:
     │       ├── sar_ascending_doy.npy   (Ta,)               int16
     │       ├── sar_descending.npy      (Td, 1024, 1024, 2) int16
     │       └── sar_descending_doy.npy  (Td,)               int16
-    └── r111616c53248/              sub-window 4
+    └── r435200c53248/              sub-window 4
         └── …
 ```
 
@@ -269,7 +271,7 @@ Behaviour worth knowing:
 - The 0.1° tile path, `--grid_id grid_<lon>_<lat>`, is also supported. It
   reproduces the reference Python implementation byte for byte and exists
   for reproducing and ingesting the existing tile archive; new production
-  goes through shards. A whole shard as one `--window 30:110592:53248:4096x4096`
+  goes through shards. A whole shard as one `--window 30:434176:53248:4096x4096`
   works too but needs tens of GB of RAM per year.
 
 ## 3. Encode: `tessera_encode` (external)
@@ -280,15 +282,15 @@ production is `tessera_encode` (C++, from the encoder repository), invoked
 per sub-window:
 
 ```bash
-tessera_encode /scratch/utm30/r110592c53248 /embeddings/ [student_large.tcw]
+tessera_encode /scratch/utm30/r434176c53248 /embeddings/ [student_large.tcw]
 ```
 
 It writes, named after the input directory:
 
 ```
 /embeddings/
-├── r110592c53248.npy          (1024, 1024, 128) int8     embedding codes
-└── r110592c53248_scales.npy   (1024, 1024)      float32  per-pixel scale
+├── r434176c53248.npy          (1024, 1024, 128) int8     embedding codes
+└── r434176c53248_scales.npy   (1024, 1024)      float32  per-pixel scale
 ```
 
 128 MiB plus 4 MiB per full sub-window, whatever the number of dates. The
@@ -304,8 +306,8 @@ When a shard's sub-windows are all encoded, one call writes the shard:
 ```bash
 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
 tessera-zarr-upload --endpoint https://s3.example --bucket tessera \
-  --prefix zarr/v2-world --zone 30 --sr 27 --sc 13 --year 2017 \
-  /embeddings/r110592c53248 /embeddings/r111616c53248
+  --prefix zarr/v2-world --zone 30 --sr 106 --sc 13 --year 2017 \
+  /embeddings/r434176c53248 /embeddings/r435200c53248
 ```
 
 Each argument is one input: a `.npy` file (its `_scales` partner beside it)
@@ -321,10 +323,10 @@ s3://tessera/zarr/v2-world/
 ├── zarr.json                                  root group
 └── utm30/
     ├── zarr.json                    zone group: spatial:transform, proj:code
-    ├── embeddings_d4/c/0/0/27/13    int8 (1, 4,   4096, 4096)  first 4 bands
-    ├── embeddings_d16/c/0/0/27/13   int8 (1, 16,  4096, 4096)  first 16 bands
-    ├── scales/c/0/27/13             f32  (1, 4096, 4096)
-    └── embeddings/c/0/0/27/13       int8 (1, 128, 4096, 4096)  written LAST
+    ├── embeddings_d4/c/0/0/106/13    int8 (1, 4,   4096, 4096)  first 4 bands
+    ├── embeddings_d16/c/0/0/106/13   int8 (1, 16,  4096, 4096)  first 16 bands
+    ├── scales/c/0/106/13             f32  (1, 4096, 4096)
+    └── embeddings/c/0/0/106/13       int8 (1, 128, 4096, 4096)  written LAST
 ```
 
 The key is `array/c/<time index>/[band chunk]/<sr>/<sc>`; the time index is
@@ -363,7 +365,7 @@ used, since the shard indices mean nothing against another grid.
 
 ## Scale of a world-year
 
-From the `--all` enumeration: 93,204 shards, 1.32 million live sub-windows.
+From the `--all` enumeration: 94,938 shards, 1.33 million live sub-windows.
 
 | stage | per sub-window | per world-year |
 |---|---|---|
