@@ -8,3 +8,4 @@
 !bin/tessera_dpixel.ml
 !bin/tessera_shard.ml
 !bin/tessera_zarr_upload.ml
+!bin/tessera_zarr_tile.ml

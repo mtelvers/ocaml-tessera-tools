@@ -80,7 +80,7 @@ for the same `zarr` reason.
 ### Container image
 
 The `Dockerfile` builds all four tools into one image (Debian 13, GDAL
-3.10, 576 MB), installing the OCaml bindings from the overlay so it tracks
+3.10, 587 MB), installing the OCaml bindings from the overlay so it tracks
 the same commits as day10:
 
 ```bash
