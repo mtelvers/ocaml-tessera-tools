@@ -22,6 +22,10 @@ World Bank boundaries + zone_grids.json
                            utmZZ/{embeddings,…,scales}/c/<t>/…/<sr>/<sc>
 ```
 
+A fourth tool, `tessera-zarr-tile`, runs the other way: it cuts
+`grid_<lon>_<lat>` tiles back out of the store in the archive's `.npy`
+layout, reading only the parts of the shards a tile touches.
+
 The unit of work is a **shard**: a 4096 × 4096 pixel (41 km) square of a UTM
 zone's 10 m grid, which is also the unit the Zarr store writes as one object
 per array. The unit of memory is a **sub-window**: a 1024 × 1024 pixel cut of
@@ -51,10 +55,10 @@ sudo apt-get install -y libgdal-dev libblosc-dev libcurl4-openssl-dev \
 opam repo add --rank 1 tunbury \
   https://github.com/tunbury/opam-repository-overlay.git
 opam update
-opam install -y stac_client gdal npy yojson cmdliner \
+opam install -y stac_client gdal npy yojson cmdliner digestif \
   zarr zarr-blosc zarr-s3 s3 eio eio_main tessera-grid
 dune build
-# _build/default/bin/: tessera_{shard,dpixel,zarr_upload}.exe
+# _build/default/bin/: tessera_{shard,dpixel,zarr_upload,zarr_tile}.exe
 ```
 
 OCaml 5.1 or later. GDAL 3.8 to 3.11 have all been checked for byte-identical
@@ -75,7 +79,7 @@ for the same `zarr` reason.
 
 ### Container image
 
-The `Dockerfile` builds all three tools into one image (Debian 13, GDAL
+The `Dockerfile` builds all four tools into one image (Debian 13, GDAL
 3.10, 576 MB), installing the OCaml bindings from the overlay so it tracks
 the same commits as day10:
 
@@ -363,6 +367,61 @@ one call, since the shard object is replaced, not merged, and make sure the
 `--prefix` store is the one whose `zone_grids.json` the other two steps
 used, since the shard indices mean nothing against another grid.
 
+## 5. Cut tiles back out: `tessera-zarr-tile`
+
+The archive that preceded the store is a directory per year of
+`grid_<lon>_<lat>` tiles, each an `.npy` pair of int8 codes `(H, W, 128)` and
+float32 scales `(H, W)` with a `SHA256` sidecar. `tessera-zarr-tile`
+produces that layout from the store, for people and pipelines that still
+want files:
+
+```bash
+tessera-zarr-tile --endpoint https://s3.us-west-2.amazonaws.com --region us-west-2 \
+  --anonymous --bucket us-west-2.opendata.source.coop \
+  --prefix 'tessera/tessera/zarr/v2-2B-L~beta1' \
+  --year 2017 --output tiles grid_-1.05_51.05 grid_-0.95_51.05
+```
+
+writes `tiles/2017/grid_-1.05_51.05/{grid_-1.05_51.05.npy,
+grid_-1.05_51.05_scales.npy, SHA256}` and the same for the second tile.
+`--shard ZONE:SR:SC` instead of tile names cuts every tile whose centre
+falls in that shard; `--list` prints what would be cut. One zone per call,
+as with the uploader.
+
+A tile is the axis-aligned UTM rectangle around its projected 0.1° cell,
+which is exactly the rectangle the encoder writes and the converter pastes
+into the zone grid at an integer offset, so a tile is a pure integer window
+of its centre zone's grid: no resampling and no curved boundary. The window
+can straddle up to four shards. The tool reads it through the sharding
+codec's partial reads (`ocaml-zarr`): the index at the end of each shard,
+then only the 32 × 32 inner chunks the window covers, coalesced into a few
+range requests. A tile of all 128 bands takes 20 to 80 s from the public
+bucket, rather than the 1.2 GB per shard a whole-object read would need.
+
+The public store is a plain S3 bucket; `--anonymous` sends unsigned
+requests, and is also what happens when no credentials are found. The year
+is looked up in the store's own `time` array, so `--year 2017` works
+whatever the first year of a store is; `--time_index` bypasses that.
+
+No-data follows the uploader's convention in reverse: a `NaN` scale
+("produced, no data") becomes the encoder's signature, an all-zero code
+vector with scale 1e-12/127, which is what the archive holds for such
+pixels. A `+inf` scale means the store never produced that pixel, so the
+tile is refused unless `--allow_partial`, which writes the signature there
+and reports the count. Note that the published beta1 store was converted
+from the archive with the signature kept as literal values, so sea pixels
+there read back as valid with a scale of 7.9e-15, not as `NaN`.
+
+What to expect against the archive: every pixel outside the overlap strips
+is bit-identical, codes and scale. Neighbouring tiles' rectangles overlap
+by up to a few tens of pixels on the east and west sides (more at high
+latitude) and a row or two top and bottom; in that strip the store holds
+whichever tile the converter pasted last, which is the neighbour's
+embedding of the same ground, with cosine 0.9998 or better to this tile's.
+A tile that the archive holds in a different inference run from the one
+the store was converted from differs everywhere by run-to-run noise
+(codes ± 1, cosine 0.99999).
+
 ## Scale of a world-year
 
 From the `--all` enumeration: 94,938 shards, 1.33 million live sub-windows.
@@ -389,6 +448,11 @@ across all workers, not CPU.
   the `.npy`, and tile placement matches geotessera's converter.
 - shard: enumerations identical to the production orchestrator's for the
   Isle of Man, the United Kingdom and the world.
+- tile: nine tiles cut from the public beta1 store (zones 5, 30, 32, 33, 34,
+  55 and 60, 38°S to 70°N, one straddling the equator, one with its west
+  edge on a central meridian, one of open sea, years 2017 and 2024) against
+  the archive they were converted from: bit-identical outside the
+  neighbour-overlap strips, SHA256 sidecars verified.
 
 ## Reference
 
@@ -441,12 +505,31 @@ Exit codes: 0 written, 2 permanent failure, 3 transient failure (re-queue).
 
 Credentials: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, else `~/.aws/credentials`.
 
+### tessera-zarr-tile
+
+| Flag | Default | Description |
+|---|---|---|
+| `--endpoint`, `--bucket`, `--prefix` | `$S3_ENDPOINT`, `$S3_BUCKET`, `$S3_PREFIX` | Source store |
+| `--region` | `$AWS_DEFAULT_REGION` or `us-east-1` | Signing region |
+| `--anonymous` | off | Unsigned requests (public bucket); implied when no credentials are found |
+| `--year` | | Year to cut, looked up in the store's `time` array |
+| `--time_index` | | Overrides `--year` |
+| `--shard` | | `ZONE:SR:SC`: every tile whose centre falls in this shard, instead of naming tiles |
+| `--output` | `.` | Tiles go to `<output>/<year>/<grid>/` |
+| `--allow_partial` | off | Write a tile the store has not fully produced, no-data where it is missing |
+| `--no_sha256` | off | Skip the `SHA256` sidecar |
+| `--domains` | 8 | Cores used to decompress inner chunks |
+| `--list` | | Print the tiles that would be cut and exit |
+
+Positional arguments are tile ids `grid_<lon>_<lat>`, all in one zone. Exit
+status is 1 if any tile failed.
+
 ### Shared geometry: `lib/tile_geom.ml`
 
 The 0.1° tile footprint on its UTM grid (dpixel's `load_roi_from_grid_id`
-plus stackstac's snap, computed with PROJ), used by both `tessera-dpixel`
-and `tessera-zarr-upload` so a tile is downloaded for the same footprint it
-is later placed at. Shard and window addressing never goes through it.
+plus stackstac's snap, computed with PROJ), used by `tessera-dpixel`,
+`tessera-zarr-upload` and `tessera-zarr-tile` so a tile is downloaded for
+the same footprint it is later placed at, and cut from. Shard and window addressing never goes through it.
 
 ## Data sources
 

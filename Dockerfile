@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# All three tools: tessera-shard, tessera-dpixel, tessera-zarr-upload.
+# All four tools: tessera-shard, tessera-dpixel, tessera-zarr-upload, tessera-zarr-tile.
 # Also the source for the Apptainer image (see README).
 FROM ocaml/opam:debian-13-ocaml-5.3 AS build
 RUN sudo ln -sf /usr/bin/opam-2.5 /usr/bin/opam && opam init --reinit -ni
@@ -20,13 +20,13 @@ RUN sudo apt update && sudo apt-get --no-install-recommends install -y \
 # priority than the default repository: upstream has an unrelated `zarr`.
 RUN opam repo add --rank 1 tunbury https://github.com/tunbury/opam-repository-overlay.git && \
     opam update && \
-    opam install -y stac_client gdal npy yojson cmdliner \
+    opam install -y stac_client gdal npy yojson cmdliner digestif \
                     zarr zarr-blosc zarr-s3 s3 eio eio_main tessera-grid
 WORKDIR /src
 COPY --chown=opam --link dune-project dune-workspace ./
 COPY --chown=opam --link lib/ lib/
-COPY --chown=opam --link bin/dune bin/tessera_dpixel.ml bin/tessera_shard.ml bin/tessera_zarr_upload.ml bin/
-RUN opam exec -- dune build bin/tessera_dpixel.exe bin/tessera_shard.exe bin/tessera_zarr_upload.exe
+COPY --chown=opam --link bin/dune bin/tessera_dpixel.ml bin/tessera_shard.ml bin/tessera_zarr_upload.ml bin/tessera_zarr_tile.ml bin/
+RUN opam exec -- dune build bin/tessera_dpixel.exe bin/tessera_shard.exe bin/tessera_zarr_upload.exe bin/tessera_zarr_tile.exe
 
 FROM debian:13
 RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
@@ -43,5 +43,6 @@ RUN apt update && apt-get --no-install-recommends install -y \
 COPY --from=build --link /src/_build/default/bin/tessera_dpixel.exe /usr/local/bin/tessera-dpixel
 COPY --from=build --link /src/_build/default/bin/tessera_shard.exe /usr/local/bin/tessera-shard
 COPY --from=build --link /src/_build/default/bin/tessera_zarr_upload.exe /usr/local/bin/tessera-zarr-upload
+COPY --from=build --link /src/_build/default/bin/tessera_zarr_tile.exe /usr/local/bin/tessera-zarr-tile
 # No entrypoint: name the tool, e.g. `docker run … tessera-tools tessera-dpixel --help`.
-CMD ["sh", "-c", "echo 'tools: tessera-shard tessera-dpixel tessera-zarr-upload'; echo; tessera-shard --help | head -20"]
+CMD ["sh", "-c", "echo 'tools: tessera-shard tessera-dpixel tessera-zarr-upload tessera-zarr-tile'; echo; tessera-shard --help | head -20"]

@@ -40,6 +40,25 @@
   yojson))
 
 (package
+ (name tessera-zarr-tile)
+ (synopsis "Cut 0.1 degree .npy tiles out of an S3 Zarr store")
+ (description "The inverse of tessera-zarr-upload: reads the window of the zone grid that a grid_<lon>_<lat> tile occupies, through partial shard reads, and writes the archive's .npy pair and SHA256 sidecar")
+ (depends
+  (ocaml (>= 5.1))
+  (dune (>= 3.0))
+  gdal
+  stac_client
+  npy
+  zarr
+  zarr-blosc
+  zarr-s3
+  s3
+  digestif
+  (eio (>= 1.0))
+  eio_main
+  yojson))
+
+(package
  (name tessera-shard)
  (synopsis "Live Zarr shards and sub-windows of a region")
  (description "tessera-tiles for the Zarr store: reads World Bank (or any OGR) region polygons and lists the shards and sub-windows of a seeded zone grid they cover")
